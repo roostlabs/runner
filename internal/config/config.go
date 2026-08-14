@@ -40,6 +40,40 @@ type Config struct {
 	DataDir string `json:"dataDir"`
 	// Creds are the credentials handed to sandboxes.
 	Creds Creds `json:"creds"`
+	// Sandbox configures how tasks are executed.
+	Sandbox Sandbox `json:"sandbox"`
+}
+
+// Sandbox configures the containers tasks run in.
+type Sandbox struct {
+	// Image is the container image, e.g. golang:1.26. The Runner ships no image
+	// of its own: which one a task needs is a property of the repository being
+	// worked on, not of the Runner.
+	Image string `json:"image"`
+	// Commands are the steps the fixed agent runs, as argv lists rather than
+	// shell lines. They stand in until an LLM-driven agent exists.
+	Commands [][]string `json:"commands,omitempty"`
+
+	CPUs      string `json:"cpus,omitempty"`
+	MemoryMB  int    `json:"memoryMb,omitempty"`
+	PidsLimit int    `json:"pidsLimit,omitempty"`
+
+	// Network is "bridge" or "none".
+	//
+	// Bridge is the default because an agent has to reach the LLM API and the
+	// git remote. It is also the route by which generated code could send the
+	// repository somewhere it should not go; narrowing that to an allowlist is
+	// open work, and "none" is available for tasks that need no network at all.
+	Network string `json:"network,omitempty"`
+
+	// WritableRoot is negated deliberately, so the zero value gives a container
+	// whose filesystem is read-only apart from the working copy and /tmp.
+	WritableRoot bool `json:"writableRoot,omitempty"`
+
+	// TimeoutMs caps one command. Zero uses the sandbox default.
+	TimeoutMs int64 `json:"timeoutMs,omitempty"`
+	// KeepWorktree leaves each task's checkout on disk, for debugging.
+	KeepWorktree bool `json:"keepWorktree,omitempty"`
 }
 
 // Creds holds the credentials a task may need. An empty field means the

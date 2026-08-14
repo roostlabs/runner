@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -41,8 +42,59 @@ func TestSaveThenLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("round trip = %+v, want %+v", got, want)
+	}
+}
+
+// The sandbox settings decide how much of the machine a task can take, so a
+// config that survives a round trip only partly would silently widen limits.
+func TestSandboxSettingsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	want := validConfig()
+	want.Sandbox = Sandbox{
+		Image:        "golang:1.26",
+		Commands:     [][]string{{"go", "build", "./..."}, {"go", "test", "./..."}},
+		CPUs:         "2",
+		MemoryMB:     1024,
+		PidsLimit:    128,
+		Network:      "none",
+		WritableRoot: true,
+		TimeoutMs:    600000,
+		KeepWorktree: true,
+	}
+	if err := Save(path, want); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !reflect.DeepEqual(got.Sandbox, want.Sandbox) {
+		t.Errorf("sandbox round trip = %+v, want %+v", got.Sandbox, want.Sandbox)
+	}
+}
+
+// A config that says nothing about the root filesystem must produce a read-only
+// one, so the safe setting is the one you get by default.
+func TestWritableRootDefaultsToFalse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	raw := []byte(`{"cloudUrl":"wss://api.example.com/channel","token":"t",
+		"dataDir":"/tmp/roost","sandbox":{"image":"alpine:3"}}`)
+	if err := os.WriteFile(path, raw, FileMode); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Chmod(path, FileMode); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Sandbox.WritableRoot {
+		t.Error("a config that says nothing produced a writable container root")
 	}
 }
 

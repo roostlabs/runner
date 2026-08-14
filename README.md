@@ -9,20 +9,23 @@ to read it is the evidence that nothing leaks upward.
 
 ## Status
 
-Early. The channel, the configuration and the event journal work; **sandbox
-execution does not exist yet**, so a `task.run` is refused honestly rather than
-silently dropped.
+Early, but a task now runs end to end. What is missing is the part that decides:
+the commands come from the config file, not from an agent.
 
 Working today:
 
 - outbound WebSocket channel to Cloud, with handshake, keepalive and
   backoff-with-jitter reconnect
 - config loading that refuses a credentials file other accounts can read
+- repositories cloned once and kept, with a fresh `git worktree` per task
+- commands executed in a disposable container under CPU, memory and pid limits
+- command output streamed with credential values masked
 - append-only SQLite event journal with per-task sequence numbers
 - `task_history`, `task_trace` and `config` queries answered from that journal
+- one task at a time, cancellable, surviving a dropped channel
 
-Next: Docker sandboxes with CPU and memory limits, `git worktree` baselines off
-a persistent clone, the agent loop, and opening the pull request.
+Next: an LLM-driven agent in place of the fixed command list, cost accounting
+from `llm_call` events, and opening the pull request under a service account.
 
 ## Build and run
 
@@ -42,9 +45,18 @@ The config is JSON and must be mode `0600`:
     "git": "...",
     "taskManager": "...",
     "llm": "..."
+  },
+  "sandbox": {
+    "image": "golang:1.26",
+    "commands": [["go", "build", "./..."], ["go", "test", "./..."]],
+    "network": "bridge"
   }
 }
 ```
+
+`sandbox.image` has no default: which image a task needs is a property of the
+repository, not of the Runner. `sandbox.commands` are argv lists, not shell
+lines, and stand in until there is an agent to produce them.
 
 `ROOST_CONFIG` overrides the config path, `ROOST_DATA_DIR` the data directory.
 
@@ -67,7 +79,20 @@ sequence number it holds per task so the Runner can replay the rest. The channel
 is observation and control, not life support.
 
 **One task at a time.** The target machine is 1 CPU and 2 GB, so concurrency is 1
-by default and sandboxes carry explicit CPU and memory limits.
+by default. Containers drop all capabilities, cannot gain new ones, get a
+read-only root with the working copy as the only writable mount, and have swap
+disabled so the memory limit is real rather than advisory.
+
+**A clean baseline per task.** The clone persists, but no task works in it: each
+gets a `git worktree` branched from the remote's head, so nothing inherits what
+the last attempt left behind.
+
+### The open risk
+
+The sandbox has network access by default, because an agent has to reach the LLM
+API and the git remote. That is also the route by which generated code could send
+a repository somewhere it should not go. Narrowing it to an allowlist is open
+work. `"network": "none"` is available today for tasks that need nothing external.
 
 ## Layout
 
@@ -77,6 +102,11 @@ by default and sandboxes carry explicit CPU and memory limits.
 | `internal/channel` | outbound WebSocket, handshake, keepalive, reconnect |
 | `internal/config` | local config and credentials, with permission checks |
 | `internal/eventstore` | append-only SQLite journal and replay |
+| `internal/repo` | persistent clones and per-task worktrees |
+| `internal/sandbox` | disposable containers under limits |
+| `internal/redact` | masks credential values in streamed output |
+| `internal/agent` | decides a task's steps; fixed for now |
+| `internal/executor` | runs a task and reports it throughout |
 
 The wire contract lives in [roostlabs/protocol](https://github.com/roostlabs/protocol).
 
@@ -94,5 +124,8 @@ can drop onto a box:
 go test -race ./...
 ```
 
-The channel tests run against a stub Cloud, so the handshake, the reconnect and
-the rejection paths are exercised without a server.
+The channel tests run against a stub Cloud and the repo tests against a local
+git repository, so neither needs a network. The sandbox tests that need a real
+container are skipped when no Docker daemon answers; the rest of the suite still
+covers the command line those containers would be started with, including the
+assertion that no credential value ever appears in it.
