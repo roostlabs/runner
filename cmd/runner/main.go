@@ -1,9 +1,10 @@
 // Command runner is the Roost task runner. It runs on the developer's own VPS,
 // dials out to Cloud, and executes tasks in disposable Docker sandboxes.
 //
-// Sandbox execution is not built yet. This binary establishes and holds the
-// channel, records task events in the local journal, and answers history
-// queries from it; a task.run is refused honestly rather than silently dropped.
+// What it does not do yet is decide anything: the steps a task runs come from
+// the config file rather than from an agent. Everything around that decision —
+// the persistent clone, the clean worktree, the container limits, the redacted
+// output, the journal — is real.
 package main
 
 import (
@@ -14,22 +15,31 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/roostlabs/protocol"
+	"github.com/roostlabs/runner/internal/agent"
 	"github.com/roostlabs/runner/internal/channel"
 	"github.com/roostlabs/runner/internal/config"
 	"github.com/roostlabs/runner/internal/eventstore"
+	"github.com/roostlabs/runner/internal/executor"
+	"github.com/roostlabs/runner/internal/redact"
+	"github.com/roostlabs/runner/internal/repo"
+	"github.com/roostlabs/runner/internal/sandbox"
 )
 
 // Version is the Runner build, set with -ldflags "-X main.Version=...".
 var Version = "dev"
+
+// errOffline means there is no channel to report on. A task keeps running
+// regardless; the journal will replay once Cloud is reachable again.
+var errOffline = errors.New("runner: not connected to cloud")
 
 func main() {
 	if err := run(); err != nil {
@@ -72,15 +82,37 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	docker := dockerVersion(ctx)
+	docker := sandbox.ServerVersion(ctx)
 	if docker == "" {
-		log.Warn("no docker daemon detected; sandboxes cannot start")
+		log.Warn("no docker daemon detected; tasks will fail until one is running")
 	}
 
-	svc := &service{cfg: cfg, store: store, log: log}
+	repos := repo.New(filepath.Join(cfg.DataDir, "repos"), cfg.Creds.Git)
+	svc := &service{
+		ctx:   ctx,
+		cfg:   cfg,
+		store: store,
+		repos: repos,
+		log:   log,
+	}
+	svc.exec = executor.New(executor.Config{
+		Repos: repos,
+		Store: store,
+		Agent: agent.FixedFromArgv(cfg.Sandbox.Commands),
+		// The filter can only mask values it was told about, which is exactly
+		// the set the sandbox is given.
+		Filter:       redact.New(cfg.Creds.Values()...),
+		Sandbox:      sandboxSpec(cfg.Sandbox),
+		Env:          cfg.Creds.Env(),
+		KeepWorktree: cfg.Sandbox.KeepWorktree,
+		Run:          sandbox.Run,
+		Logger:       log,
+	})
+
 	log.Info("runner starting",
 		"version", Version, "cloud", cfg.CloudURL, "dataDir", cfg.DataDir,
-		"creds", cfg.Creds, "docker", docker)
+		"creds", cfg.Creds, "docker", docker, "image", cfg.Sandbox.Image,
+		"steps", len(cfg.Sandbox.Commands))
 
 	return channel.Run(ctx, channel.Options{
 		URL:           cfg.CloudURL,
@@ -96,47 +128,102 @@ func run() error {
 	}, svc.handle)
 }
 
+// sandboxSpec maps the config onto a container spec. WritableRoot is negated
+// here so that a config which says nothing produces a read-only container.
+func sandboxSpec(cfg config.Sandbox) sandbox.Spec {
+	spec := sandbox.Spec{
+		Image:        cfg.Image,
+		Env:          nil, // filled in per task by the executor
+		User:         sandbox.CurrentUser(),
+		CPUs:         cfg.CPUs,
+		MemoryMB:     cfg.MemoryMB,
+		PidsLimit:    cfg.PidsLimit,
+		Network:      cfg.Network,
+		ReadOnlyRoot: !cfg.WritableRoot,
+	}
+	if cfg.TimeoutMs > 0 {
+		spec.Timeout = time.Duration(cfg.TimeoutMs) * time.Millisecond
+	}
+	return spec
+}
+
 // service holds what handling a message needs.
 type service struct {
+	// ctx is the process lifetime, not a connection's. Tasks are started from
+	// it so that a dropped channel does not kill work in progress.
+	ctx   context.Context
 	cfg   config.Config
 	store *eventstore.Store
+	repos *repo.Manager
+	exec  *executor.Executor
 	log   *slog.Logger
+
+	// conn is the current connection, replaced on every reconnect. A task that
+	// outlives a connection reports onto whatever is current when it writes.
+	conn atomic.Pointer[channel.Conn]
 }
 
 // onConnect sends the state Cloud needs as soon as the channel is up, on every
 // connection including reconnects, since Cloud keeps minimal state of its own.
 func (s *service) onConnect(ctx context.Context, c *channel.Conn) error {
+	s.conn.Store(c)
+
 	if err := c.SendMessage(ctx, protocol.TypeCredStatus, s.cfg.Creds.Status()); err != nil {
 		return err
 	}
-	return c.SendMessage(ctx, protocol.TypeStatus, protocol.Status{
-		State:       protocol.RunnerIdle,
-		ActiveTasks: nil,
-		QueuedTasks: 0,
-	})
+	if err := c.SendMessage(ctx, protocol.TypeStatus, s.status()); err != nil {
+		return err
+	}
+	return c.SendMessage(ctx, protocol.TypeRepoStatus, s.repos.Status(ctx))
+}
+
+func (s *service) status() protocol.Status {
+	state := protocol.RunnerIdle
+	var activeTasks []string
+	if id, busy := s.exec.Active(); busy {
+		state = protocol.RunnerBusy
+		activeTasks = []string{id}
+	}
+	return protocol.Status{State: state, ActiveTasks: activeTasks}
 }
 
 // handle dispatches one inbound message. It returns an error only when the
-// connection itself is no longer usable; a message the Runner cannot satisfy is
+// connection itself is no longer usable; anything the Runner cannot satisfy is
 // answered with a protocol error instead.
+//
+// Nothing here may block: this runs on the channel's read loop, so a handler
+// that waits stalls every other message. Work goes to a goroutine.
 func (s *service) handle(ctx context.Context, c *channel.Conn, env protocol.Envelope) error {
 	switch env.Type {
 	case protocol.TypeTaskRun:
-		return s.handleTaskRun(ctx, c, env)
+		var task protocol.TaskRun
+		if err := env.Decode(&task); err != nil {
+			return s.replyError(ctx, c, env.ID, protocol.ErrInternal, err.Error())
+		}
+		s.startTask(task, env.ID)
+		return nil
 
 	case protocol.TypeTaskCancel:
 		var cancel protocol.TaskCancel
 		if err := env.Decode(&cancel); err != nil {
 			return s.replyError(ctx, c, env.ID, protocol.ErrInternal, err.Error())
 		}
-		s.log.Info("cancel for a task that is not running", "taskId", cancel.TaskID)
-		return s.replyError(ctx, c, env.ID, protocol.ErrTaskNotFound, "no such task is running")
+		if !s.exec.Cancel(cancel.TaskID) {
+			return s.replyError(ctx, c, env.ID, protocol.ErrTaskNotFound, "no such task is running")
+		}
+		s.log.Info("cancelling task", "taskId", cancel.TaskID, "reason", cancel.Reason)
+		return nil
+
+	case protocol.TypeRepoPrepare:
+		var prepare protocol.RepoPrepare
+		if err := env.Decode(&prepare); err != nil {
+			return s.replyError(ctx, c, env.ID, protocol.ErrInternal, err.Error())
+		}
+		go s.prepareRepo(prepare)
+		return nil
 
 	case protocol.TypeTaskApprove:
 		return s.replyError(ctx, c, env.ID, protocol.ErrTaskNotFound, "no task is awaiting approval")
-
-	case protocol.TypeRepoPrepare:
-		return s.replyError(ctx, c, env.ID, protocol.ErrInternal, "repo preparation is not implemented in this build")
 
 	case protocol.TypeCredSet:
 		// Local mode is the default and this build has no Managed mode, so a
@@ -184,46 +271,92 @@ func (s *service) handle(ctx context.Context, c *channel.Conn, env protocol.Enve
 	}
 }
 
-// handleTaskRun records the request and fails it, because there is no sandbox to
-// run it in yet. Recording first means the dashboard shows a real trace rather
-// than a task that vanished.
-func (s *service) handleTaskRun(ctx context.Context, c *channel.Conn, env protocol.Envelope) error {
-	var task protocol.TaskRun
-	if err := env.Decode(&task); err != nil {
-		return s.replyError(ctx, c, env.ID, protocol.ErrInternal, err.Error())
-	}
+// startTask runs a task on its own goroutine, tied to the process rather than to
+// the connection or the message that asked for it.
+func (s *service) startTask(task protocol.TaskRun, ref string) {
 	s.log.Info("task requested",
 		"taskId", task.TaskID, "repo", task.Repo,
 		"ticket", task.Ticket.ID, "budgetUsd", task.BudgetUSD)
 
-	const reason = "sandbox execution is not implemented in this runner build"
-	if err := s.emit(ctx, c, task.TaskID, protocol.EventError,
-		protocol.EventErrorPayload{Msg: reason}); err != nil {
-		return err
-	}
-	return c.SendMessage(ctx, protocol.TypeTaskState, protocol.TaskState{
-		State:  protocol.TaskFailed,
-		Reason: reason,
-	})
+	go func() {
+		err := s.exec.Run(s.ctx, task, s)
+		s.announceStatus()
+
+		switch {
+		case err == nil:
+			s.log.Info("task finished", "taskId", task.TaskID)
+		case errors.Is(err, executor.ErrBusy):
+			// Concurrency is 1, so this is a queueing signal rather than a
+			// failure. Cloud decides whether to retry.
+			s.log.Info("refusing task: already busy", "taskId", task.TaskID)
+			s.sendError(ref, protocol.ErrBusy, err.Error())
+		default:
+			s.log.Warn("task failed", "taskId", task.TaskID, "err", err)
+		}
+	}()
+
+	s.announceStatus()
 }
 
-// emit journals an event and then streams it.
-//
-// The order is the invariant the whole history model rests on: the VPS is the
-// source of truth, so an event that is not stored must not be considered sent.
-func (s *service) emit(ctx context.Context, c *channel.Conn, taskID string, kind protocol.EventKind, payload any) error {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("encode %s payload: %w", kind, err)
+func (s *service) prepareRepo(prepare protocol.RepoPrepare) {
+	s.log.Info("preparing repo", "url", prepare.URL, "branch", prepare.Branch)
+	if _, err := s.repos.Prepare(s.ctx, prepare.URL, prepare.Branch); err != nil {
+		s.log.Warn("could not prepare repo", "url", prepare.URL, "err", err)
+		s.sendError("", protocol.ErrInternal, err.Error())
+		return
 	}
-	seq, err := s.store.Append(ctx, taskID, kind, raw, time.Now().UnixMilli())
-	if err != nil {
-		return err
+	if c := s.conn.Load(); c != nil {
+		if err := c.SendMessage(s.ctx, protocol.TypeRepoStatus, s.repos.Status(s.ctx)); err != nil {
+			s.log.Debug("could not report repo status", "err", err)
+		}
 	}
-	return c.SendTaskMessage(ctx, protocol.TypeTaskEvent, taskID, seq, protocol.TaskEvent{
-		Event:   kind,
-		Payload: raw,
-	})
+}
+
+// The Reporter implementation. Each call resolves the current connection, so a
+// task that spans a reconnect keeps reporting onto the live one.
+
+func (s *service) TaskEvent(ctx context.Context, taskID string, seq uint64, ev protocol.TaskEvent) error {
+	c := s.conn.Load()
+	if c == nil {
+		return errOffline
+	}
+	return c.SendTaskMessage(ctx, protocol.TypeTaskEvent, taskID, seq, ev)
+}
+
+func (s *service) TaskState(ctx context.Context, taskID string, st protocol.TaskState) error {
+	c := s.conn.Load()
+	if c == nil {
+		return errOffline
+	}
+	return c.SendTaskMessage(ctx, protocol.TypeTaskState, taskID, 0, st)
+}
+
+func (s *service) TaskResult(ctx context.Context, taskID string, res protocol.TaskResult) error {
+	c := s.conn.Load()
+	if c == nil {
+		return errOffline
+	}
+	return c.SendTaskMessage(ctx, protocol.TypeTaskResult, taskID, 0, res)
+}
+
+func (s *service) announceStatus() {
+	c := s.conn.Load()
+	if c == nil {
+		return
+	}
+	if err := c.SendMessage(s.ctx, protocol.TypeStatus, s.status()); err != nil {
+		s.log.Debug("could not report status", "err", err)
+	}
+}
+
+func (s *service) sendError(ref string, code protocol.ErrorCode, msg string) {
+	c := s.conn.Load()
+	if c == nil {
+		return
+	}
+	if err := c.SendMessage(s.ctx, protocol.TypeError, protocol.Error{Code: code, Ref: ref, Msg: msg}); err != nil {
+		s.log.Debug("could not report an error", "err", err)
+	}
 }
 
 // traceParams is the payload of a task_trace query.
@@ -233,12 +366,14 @@ type traceParams struct {
 	Limit    int    `json:"limit"`
 }
 
-// configView is the config as Cloud is allowed to see it: endpoint and paths,
-// credentials as flags, and no token.
+// configView is the config as Cloud is allowed to see it: endpoint, paths and
+// limits, credentials as flags, and no token.
 type configView struct {
 	CloudURL      string              `json:"cloudUrl"`
 	DataDir       string              `json:"dataDir"`
 	RunnerVersion string              `json:"runnerVersion"`
+	Image         string              `json:"image"`
+	Network       string              `json:"network"`
 	Creds         protocol.CredStatus `json:"creds"`
 }
 
@@ -283,10 +418,16 @@ func (s *service) query(ctx context.Context, q protocol.Query) (any, error) {
 		return s.store.Since(ctx, p.TaskID, p.AfterSeq, p.Limit)
 
 	case protocol.QueryConfig:
+		network := s.cfg.Sandbox.Network
+		if network == "" {
+			network = sandbox.NetworkBridge
+		}
 		return configView{
 			CloudURL:      s.cfg.CloudURL,
 			DataDir:       s.cfg.DataDir,
 			RunnerVersion: Version,
+			Image:         s.cfg.Sandbox.Image,
+			Network:       network,
 			Creds:         s.cfg.Creds.Status(),
 		}, nil
 
@@ -300,20 +441,6 @@ func (s *service) query(ctx context.Context, q protocol.Query) (any, error) {
 
 func (s *service) replyError(ctx context.Context, c *channel.Conn, ref string, code protocol.ErrorCode, msg string) error {
 	return c.SendMessage(ctx, protocol.TypeError, protocol.Error{Code: code, Ref: ref, Msg: msg})
-}
-
-// dockerVersion reports the Docker server version, or an empty string when no
-// daemon answers. Docker is a prerequisite, but a missing one is a warning at
-// startup rather than a refusal to run: the channel still has value.
-func dockerVersion(ctx context.Context) string {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	out, err := exec.CommandContext(ctx, "docker", "version", "--format", "{{.Server.Version}}").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
 }
 
 func parseLevel(s string) (slog.Level, error) {
