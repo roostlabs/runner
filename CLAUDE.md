@@ -44,5 +44,11 @@ gofmt -l . && go vet ./... && go test -race ./...
 
 ## Залежність від protocol
 
-`go.mod` має `replace github.com/roostlabs/protocol => ../protocol` для швидкої
-ітерації. Коли протокол устоїться — прибрати `replace` і залежати від тега.
+`go.mod` вимагає тег (зараз `v0.2.0`) і має
+`replace github.com/roostlabs/protocol => ../protocol` для швидкої ітерації.
+
+`replace` прибрати **не можна, поки `roostlabs/protocol` приватний**: модуль не
+проходить через `proxy.golang.org`, тож `go build` без `replace` падає на
+`git ls-remote ... exit status 128`. Тег є і відповідає коду — але зовні
+недоступний. Коли репо стане публічним: `go mod tidy` (у `go.sum` немає запису
+для protocol, бо `replace` його не потребує), потім прибрати `replace`.
