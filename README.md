@@ -9,9 +9,7 @@ to read it is the evidence that nothing leaks upward.
 
 ## Status
 
-Early, but a task now runs end to end and an agent decides what it does. What is
-missing is the last step: the work is left in the checkout rather than committed
-and opened as a pull request.
+A ticket goes in and a pull request comes out. Early, but whole.
 
 Working today:
 
@@ -28,9 +26,11 @@ Working today:
   commands, through a session that cannot reach past the task's checkout
 - every model call priced and journalled as an `llm_call` event, and a budget
   that stops the task rather than only reporting the overspend
+- the work committed to the task's branch and opened as a pull request, under a
+  service account that cannot merge it
 
-Next: committing what the agent left and opening the pull request under a
-service account with no merge rights.
+Not there yet: metrics, human approval mid-task, and any forge other than
+GitHub.
 
 ## Build and run
 
@@ -61,6 +61,10 @@ The config is JSON and must be mode `0600`:
     "effort": "xhigh",
     "maxSteps": 40,
     "budgetUsd": 5
+  },
+  "git": {
+    "authorName": "Roost",
+    "authorEmail": "roost@example.com"
   }
 }
 ```
@@ -106,7 +110,14 @@ disabled so the memory limit is real rather than advisory.
 
 **A clean baseline per task.** The clone persists, but no task works in it: each
 gets a `git worktree` branched from the remote's head, so nothing inherits what
-the last attempt left behind.
+the last attempt left behind. Git hooks are disabled throughout, because a
+repository's hooks are files in the tree being checked out and git would run
+them on the host, outside the container everything else is confined to.
+
+**A pull request, never a merge.** The work lands on a branch under `roost/` and
+is opened for review by a service account. That account needs to push and to
+open pull requests; it should not be able to merge one. Nothing in the Runner
+can, either.
 
 ### The open risk
 
@@ -127,6 +138,7 @@ work. `"network": "none"` is available today for tasks that need nothing externa
 | `internal/sandbox` | disposable containers under limits |
 | `internal/redact` | masks credential values in streamed output |
 | `internal/llm` | the Anthropic Messages API, and what a call cost |
+| `internal/forge` | opens the pull request the work becomes |
 | `internal/agent` | decides a task's work; a model, or a fixed command list |
 | `internal/executor` | runs a task, reports it throughout, and holds the budget |
 

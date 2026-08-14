@@ -134,6 +134,67 @@ func (r *Repo) Worktree(ctx context.Context, taskID string) (*Worktree, error) {
 	return &Worktree{Path: path, Branch: branch, repo: r}, nil
 }
 
+// Author is who the Runner's commits are attributed to.
+//
+// It is a service account, not the developer: a commit that claimed to be
+// theirs would put their name on work they have not read yet.
+type Author struct {
+	Name  string
+	Email string
+}
+
+// DefaultAuthor is used when the config names no other.
+var DefaultAuthor = Author{Name: "Roost", Email: "roost@localhost"}
+
+// Commit records everything in the worktree, reporting whether there was
+// anything to record.
+//
+// Nothing to record is an ordinary outcome: an agent that read the ticket and
+// concluded the code is already correct has done its job, and a commit forced
+// out of that would be an empty one.
+func (w *Worktree) Commit(ctx context.Context, message string, author Author) (bool, error) {
+	if strings.TrimSpace(message) == "" {
+		return false, errors.New("repo: refusing to commit without a message")
+	}
+	if author.Name == "" {
+		author = DefaultAuthor
+	}
+
+	if _, err := w.repo.mgr.git(ctx, w.Path, "add", "--all"); err != nil {
+		return false, err
+	}
+	// A zero exit from diff --quiet means nothing is staged.
+	if _, err := w.repo.mgr.git(ctx, w.Path, "diff", "--cached", "--quiet"); err == nil {
+		return false, nil
+	}
+
+	_, err := w.repo.mgr.git(ctx, w.Path,
+		"-c", "user.name="+author.Name,
+		"-c", "user.email="+author.Email,
+		"commit", "--no-verify", "--message", message)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Push publishes the task's branch.
+//
+// The push is forced because the branch belongs to the task: it is named after
+// the task id under the Runner's own prefix, so the only thing that can be
+// overwritten is an earlier attempt at the same ticket.
+func (w *Worktree) Push(ctx context.Context) error {
+	_, err := w.repo.mgr.git(ctx, w.Path, "push", "--force", "origin",
+		"HEAD:refs/heads/"+w.Branch)
+	return err
+}
+
+// Head is the commit the worktree is on.
+func (w *Worktree) Head(ctx context.Context) (string, error) {
+	out, err := w.repo.mgr.git(ctx, w.Path, "rev-parse", "HEAD")
+	return strings.TrimSpace(out), err
+}
+
 // Remove discards the worktree. The branch survives, because the commits on it
 // are the task's output.
 func (w *Worktree) Remove(ctx context.Context) error {
@@ -219,21 +280,28 @@ func (m *Manager) git(ctx context.Context, dir string, args ...string) (string, 
 	return string(out), nil
 }
 
-// configArgs authenticates https remotes without the token ever appearing in the
-// command line.
+// configArgs is what every git invocation carries.
 //
-// The helper is a shell snippet that reads the value out of the environment, so
-// what lands in ps is the snippet, not the credential. The empty helper first
-// clears any inherited one, so a keychain or store on the host cannot answer
-// instead and quietly use the wrong identity.
+// core.hooksPath is the important half. A repository's hooks live in the files
+// git is being asked to check out, and git runs them on the host, outside the
+// container everything else is confined to: a post-checkout hook in a cloned
+// repository would execute as the Runner. Pointing hooksPath at a path holding
+// no hooks turns that off for clone, fetch, worktree, commit and push alike.
+//
+// The credential helper authenticates https remotes without the token ever
+// appearing in the command line: the helper is a shell snippet that reads the
+// value out of the environment, so what lands in ps is the snippet, not the
+// credential. The empty helper first clears any inherited one, so a keychain or
+// store on the host cannot answer instead and quietly use the wrong identity.
 func (m *Manager) configArgs() []string {
+	args := []string{"-c", "core.hooksPath=/dev/null"}
 	if m.token == "" {
-		return nil
+		return args
 	}
-	return []string{
+	return append(args,
 		"-c", "credential.helper=",
 		"-c", `credential.helper=!f() { echo "username=x-access-token"; echo "password=$ROOST_GIT_TOKEN"; }; f`,
-	}
+	)
 }
 
 var unsafeChars = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)

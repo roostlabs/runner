@@ -1,10 +1,12 @@
 // Command runner is the Roost task runner. It runs on the developer's own VPS,
 // dials out to Cloud, and executes tasks in disposable Docker sandboxes.
 //
-// What it does not do yet is the last step: the work an agent finishes is left
-// in the task's checkout rather than committed and opened as a pull request.
-// Everything before that — the persistent clone, the clean worktree, the
-// container limits, the redacted output, the journal, the budget — is real.
+// A ticket goes in and a pull request comes out: the repository is cloned once
+// and kept, each task gets a clean worktree, an agent works in a container
+// under limits, every event is journalled before it is streamed, credentials
+// are masked out of everything that leaves the box, spend is metered against a
+// budget, and the result is a branch opened for review by a service account
+// that cannot merge it.
 package main
 
 import (
@@ -29,6 +31,7 @@ import (
 	"github.com/roostlabs/runner/internal/config"
 	"github.com/roostlabs/runner/internal/eventstore"
 	"github.com/roostlabs/runner/internal/executor"
+	"github.com/roostlabs/runner/internal/forge"
 	"github.com/roostlabs/runner/internal/llm"
 	"github.com/roostlabs/runner/internal/redact"
 	"github.com/roostlabs/runner/internal/repo"
@@ -93,6 +96,14 @@ func run() error {
 		return err
 	}
 
+	openPR, err := newForge(cfg)
+	if err != nil {
+		return err
+	}
+	if openPR == nil {
+		log.Warn("no git credential configured; a task that changes anything will have nowhere to open a pull request")
+	}
+
 	repos := repo.New(filepath.Join(cfg.DataDir, "repos"), cfg.Creds.Git)
 	svc := &service{
 		ctx:   ctx,
@@ -107,6 +118,8 @@ func run() error {
 		Agent:     brain,
 		LLM:       model,
 		BudgetUSD: cfg.Agent.BudgetUSD,
+		Forge:     openPR,
+		Author:    author(cfg.Git),
 		// The filter can only mask values it was told about, which is exactly
 		// the set the sandbox is given.
 		Filter:       redact.New(cfg.Creds.Values()...),
@@ -158,6 +171,35 @@ func newAgent(cfg config.Config) (agent.Agent, *llm.Client, error) {
 		return nil, nil, err
 	}
 	return agent.Model{MaxSteps: cfg.Agent.MaxSteps}, client, nil
+}
+
+// newForge builds the pull-request opener, or reports that there is none.
+//
+// The git credential is what makes one possible: without it the Runner cannot
+// push a branch, let alone open anything on top of it.
+func newForge(cfg config.Config) (executor.PRFunc, error) {
+	if cfg.Creds.Git == "" {
+		return nil, nil
+	}
+	client, err := forge.New(forge.Options{
+		Token:   cfg.Creds.Git,
+		APIBase: cfg.Git.APIBase,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return client.Open, nil
+}
+
+func author(cfg config.Git) repo.Author {
+	a := repo.DefaultAuthor
+	if cfg.AuthorName != "" {
+		a.Name = cfg.AuthorName
+	}
+	if cfg.AuthorEmail != "" {
+		a.Email = cfg.AuthorEmail
+	}
+	return a
 }
 
 func agentKind(model *llm.Client) string {

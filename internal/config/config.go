@@ -44,6 +44,19 @@ type Config struct {
 	Sandbox Sandbox `json:"sandbox"`
 	// Agent configures the model that decides what to execute.
 	Agent Agent `json:"agent"`
+	// Git configures how the work is committed and published.
+	Git Git `json:"git"`
+}
+
+// Git configures the commit and the pull request a finished task becomes.
+type Git struct {
+	// AuthorName and AuthorEmail attribute the Runner's commits. They belong
+	// to a service account, not to the developer: a commit claiming to be
+	// theirs would put their name on work they have not read yet.
+	AuthorName  string `json:"authorName,omitempty"`
+	AuthorEmail string `json:"authorEmail,omitempty"`
+	// APIBase overrides the forge's API endpoint, for GitHub Enterprise.
+	APIBase string `json:"apiBase,omitempty"`
 }
 
 // Agent configures the LLM-driven agent.

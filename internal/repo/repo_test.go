@@ -267,7 +267,150 @@ func TestConfigArgsDoNotCarryTheToken(t *testing.T) {
 	if !strings.Contains(joined, "ROOST_GIT_TOKEN") {
 		t.Errorf("git config args never read the token: %s", joined)
 	}
-	if len(New(t.TempDir(), "").configArgs()) != 0 {
+	if strings.Contains(strings.Join(New(t.TempDir(), "").configArgs(), " "), "credential.helper") {
 		t.Error("a manager with no token still configured a credential helper")
+	}
+}
+
+// A repository's hooks are files in the tree git is being asked to check out,
+// and git runs them on the host, outside the container everything else is
+// confined to. Cloning a hostile repository must not execute it.
+func TestHooksNeverRunOnTheHost(t *testing.T) {
+	ctx := context.Background()
+	src := origin(t)
+
+	// A post-checkout hook fires on clone and on every worktree add.
+	hook := filepath.Join(src, ".git", "hooks", "post-checkout")
+	marker := filepath.Join(t.TempDir(), "hook-ran")
+	script := "#!/bin/sh\ntouch " + marker + "\n"
+	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	m := New(t.TempDir(), "")
+	r, err := m.Prepare(ctx, src, "")
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if _, err := r.Worktree(ctx, "T-1"); err != nil {
+		t.Fatalf("Worktree: %v", err)
+	}
+
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("a hook from the cloned repository executed on the host")
+	}
+}
+
+func TestCommitAndPush(t *testing.T) {
+	ctx := context.Background()
+	src := origin(t)
+
+	m := New(t.TempDir(), "")
+	r, err := m.Prepare(ctx, src, "")
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	w, err := r.Worktree(ctx, "T-1")
+	if err != nil {
+		t.Fatalf("Worktree: %v", err)
+	}
+
+	// Nothing changed yet, so there is nothing to commit.
+	changed, err := w.Commit(ctx, "should not happen", Author{})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if changed {
+		t.Error("Commit made a commit with nothing staged")
+	}
+
+	if err := os.WriteFile(filepath.Join(w.Path, "new.txt"), []byte("work\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	author := Author{Name: "Roost", Email: "roost@example.com"}
+	changed, err = w.Commit(ctx, "add new.txt\n\nBecause the ticket asked.", author)
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if !changed {
+		t.Fatal("Commit ignored a new file")
+	}
+
+	out, err := m.git(ctx, w.Path, "log", "-1", "--format=%an <%ae>%n%B")
+	if err != nil {
+		t.Fatalf("log: %v", err)
+	}
+	if !strings.Contains(out, "Roost <roost@example.com>") {
+		t.Errorf("commit author = %q", out)
+	}
+	if !strings.Contains(out, "Because the ticket asked.") {
+		t.Errorf("commit body = %q", out)
+	}
+
+	if err := w.Push(ctx); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	pushed, err := m.git(ctx, src, "log", "-1", "--format=%s", "refs/heads/"+w.Branch)
+	if err != nil {
+		t.Fatalf("the branch did not reach the origin: %v", err)
+	}
+	if strings.TrimSpace(pushed) != "add new.txt" {
+		t.Errorf("origin has %q", strings.TrimSpace(pushed))
+	}
+}
+
+// A retried ticket works on the same branch, so its push has to replace what
+// the previous attempt left rather than be rejected.
+func TestPushReplacesAPreviousAttempt(t *testing.T) {
+	ctx := context.Background()
+	src := origin(t)
+	m := New(t.TempDir(), "")
+
+	commitAndPush := func(content string) {
+		t.Helper()
+		r, err := m.Prepare(ctx, src, "")
+		if err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		w, err := r.Worktree(ctx, "T-1")
+		if err != nil {
+			t.Fatalf("Worktree: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(w.Path, "new.txt"), []byte(content), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		if _, err := w.Commit(ctx, "attempt "+content, Author{}); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		if err := w.Push(ctx); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+
+	commitAndPush("one")
+	commitAndPush("two")
+
+	out, err := m.git(ctx, src, "log", "-1", "--format=%s", "refs/heads/roost/T-1")
+	if err != nil {
+		t.Fatalf("log: %v", err)
+	}
+	if strings.TrimSpace(out) != "attempt two" {
+		t.Errorf("origin has %q, want the second attempt", strings.TrimSpace(out))
+	}
+}
+
+func TestCommitRefusesAnEmptyMessage(t *testing.T) {
+	ctx := context.Background()
+	m := New(t.TempDir(), "")
+	r, err := m.Prepare(ctx, origin(t), "")
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	w, err := r.Worktree(ctx, "T-1")
+	if err != nil {
+		t.Fatalf("Worktree: %v", err)
+	}
+	if _, err := w.Commit(ctx, "  \n ", Author{}); err == nil {
+		t.Error("Commit accepted an empty message")
 	}
 }

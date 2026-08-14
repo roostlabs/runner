@@ -19,12 +19,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/roostlabs/protocol"
 	"github.com/roostlabs/runner/internal/agent"
 	"github.com/roostlabs/runner/internal/eventstore"
+	"github.com/roostlabs/runner/internal/forge"
 	"github.com/roostlabs/runner/internal/llm"
 	"github.com/roostlabs/runner/internal/redact"
 	"github.com/roostlabs/runner/internal/repo"
@@ -61,6 +63,9 @@ type Reporter interface {
 // drive the executor without a Docker daemon.
 type RunFunc func(ctx context.Context, spec sandbox.Spec, argv []string, stdout, stderr io.Writer) (sandbox.Result, error)
 
+// PRFunc opens a pull request. It is a field for the same reason RunFunc is.
+type PRFunc func(ctx context.Context, req forge.Request) (forge.PR, error)
+
 // Config assembles an Executor.
 type Config struct {
 	Repos *repo.Manager
@@ -72,6 +77,14 @@ type Config struct {
 	// BudgetUSD caps what one task may spend when the task itself names no
 	// budget. Zero means uncapped.
 	BudgetUSD float64
+	// Forge opens the pull request a finished task becomes. Nil means a task
+	// that changed something has nowhere to put it, which is reported as an
+	// error rather than left as a commit nobody will see.
+	Forge PRFunc
+	// Author is who the Runner's commits are attributed to. It is a service
+	// account: a commit claiming to be the developer's would put their name on
+	// work they have not read.
+	Author repo.Author
 	// Filter masks credential values in command output. Nil masks nothing,
 	// which is correct only when there are no credentials.
 	Filter *redact.Filter
@@ -186,8 +199,9 @@ func (e *Executor) Run(ctx context.Context, task protocol.TaskRun, rep Reporter)
 		e.state(reportCtx, task.TaskID, protocol.TaskFailed, err.Error(), rep)
 	}
 
-	cost, tokens := sess.totals()
+	cost, tokens, prURL := sess.totals()
 	if repErr := rep.TaskResult(reportCtx, task.TaskID, protocol.TaskResult{
+		PRURL:      prURL,
 		CostUSD:    cost,
 		Tokens:     tokens,
 		DurationMs: duration.Milliseconds(),
@@ -250,7 +264,103 @@ func (e *Executor) execute(ctx context.Context, task protocol.TaskRun, rep Repor
 		return err
 	}
 	e.log.Info("agent finished", "taskId", task.TaskID, "title", result.Title)
+	return e.publish(ctx, task, prepared, worktree, result, sess, rep)
+}
+
+// publish turns what the agent left in the checkout into a pull request.
+//
+// Nothing is merged and nothing reaches the default branch. What the developer
+// asked for is a change waiting for review in the morning, and that is the
+// whole of what this does.
+func (e *Executor) publish(
+	ctx context.Context,
+	task protocol.TaskRun,
+	prepared *repo.Repo,
+	worktree *repo.Worktree,
+	result agent.Result,
+	sess *session,
+	rep Reporter,
+) error {
+	e.emit(ctx, task.TaskID, protocol.EventStage, protocol.StagePayload{Name: "commit"}, rep)
+
+	changed, err := worktree.Commit(ctx, commitMessage(task, result), e.cfg.Author)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		// An agent that read the ticket and found nothing to change has done
+		// its job. Forcing a commit out of that would open a pull request with
+		// nothing in it.
+		e.emit(ctx, task.TaskID, protocol.EventStage, protocol.StagePayload{Name: "no-changes"}, rep)
+		e.log.Info("the agent changed nothing", "taskId", task.TaskID)
+		return nil
+	}
+	if e.cfg.Forge == nil {
+		return errors.New("executor: the agent made changes but no forge is configured to open a pull request")
+	}
+
+	e.emit(ctx, task.TaskID, protocol.EventStage, protocol.StagePayload{Name: "open-pull-request"}, rep)
+	if err := worktree.Push(ctx); err != nil {
+		return err
+	}
+
+	pr, err := e.cfg.Forge(ctx, forge.Request{
+		RemoteURL: task.Repo,
+		Base:      prepared.DefaultBranch,
+		Head:      worktree.Branch,
+		Title:     result.Title,
+		Body:      result.Summary,
+	})
+	if err != nil {
+		return err
+	}
+
+	sess.setPR(pr.URL)
+	e.emit(ctx, task.TaskID, protocol.EventPR, protocol.PRPayload{
+		URL:    pr.URL,
+		Branch: worktree.Branch,
+	}, rep)
+	e.log.Info("opened a pull request",
+		"taskId", task.TaskID, "url", pr.URL, "branch", worktree.Branch, "existed", pr.Existed)
 	return nil
+}
+
+// subjectLimit is where a commit subject stops being a subject.
+const subjectLimit = 72
+
+// commitMessage is what the task leaves in the developer's history.
+//
+// It carries the agent's own title and summary and a reference back to the
+// ticket, and nothing about what produced it. The commit is read as part of the
+// repository, not as a record of the tool that wrote it.
+func commitMessage(task protocol.TaskRun, result agent.Result) string {
+	subject, _, _ := strings.Cut(strings.TrimSpace(result.Title), "\n")
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		subject = "apply the changes for " + task.TaskID
+	}
+	if len(subject) > subjectLimit {
+		subject = strings.TrimSpace(subject[:subjectLimit])
+	}
+
+	var b strings.Builder
+	b.WriteString(subject)
+	if summary := strings.TrimSpace(result.Summary); summary != "" {
+		b.WriteString("\n\n")
+		b.WriteString(summary)
+	}
+	if ref := ticketRef(task.Ticket); ref != "" {
+		b.WriteString("\n\nRefs: ")
+		b.WriteString(ref)
+	}
+	return b.String()
+}
+
+func ticketRef(ticket protocol.Ticket) string {
+	if ticket.URL != "" {
+		return ticket.URL
+	}
+	return ticket.ID
 }
 
 // session is the executor's side of agent.Session: the only surface an agent
@@ -268,14 +378,21 @@ type session struct {
 	steps  int
 	cost   float64
 	tokens protocol.Tokens
+	prURL  string
 }
 
 func (s *session) WorkDir() string { return s.workDir }
 
-func (s *session) totals() (float64, protocol.Tokens) {
+func (s *session) setPR(url string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.cost, s.tokens
+	s.prURL = url
+}
+
+func (s *session) totals() (float64, protocol.Tokens, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cost, s.tokens, s.prURL
 }
 
 // Exec runs one command in a container and reports it as it goes.

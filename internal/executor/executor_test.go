@@ -189,6 +189,10 @@ func TestRunReportsAFullTrace(t *testing.T) {
 		protocol.EventCmdStart, protocol.EventCmdOutput, protocol.EventCmdExit,
 		protocol.EventAgentStep,
 		protocol.EventCmdStart, protocol.EventCmdOutput, protocol.EventCmdExit,
+		// The commit stage, and then the report that there was nothing to
+		// commit: running commands changes no files.
+		protocol.EventStage,
+		protocol.EventStage,
 	}
 	if got := f.kindsMatch(rec, wantKinds); !got {
 		t.Errorf("event kinds = %v, want %v", rec.kinds(), wantKinds)
