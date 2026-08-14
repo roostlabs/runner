@@ -2,22 +2,30 @@
 //
 // It is the piece that holds the Runner's promises together: one task at a time,
 // a clean baseline for each, execution only inside a container, every event
-// journalled before it is streamed, and no credential in the output.
+// journalled before it is streamed, no credential in the output, and every
+// model call priced and charged against the task's budget.
+//
+// The agent is handed a Session rather than any of these components, so the
+// promises are not something an agent has to cooperate with.
 package executor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/roostlabs/protocol"
 	"github.com/roostlabs/runner/internal/agent"
 	"github.com/roostlabs/runner/internal/eventstore"
+	"github.com/roostlabs/runner/internal/llm"
 	"github.com/roostlabs/runner/internal/redact"
 	"github.com/roostlabs/runner/internal/repo"
 	"github.com/roostlabs/runner/internal/sandbox"
@@ -29,6 +37,15 @@ var ErrBusy = errors.New("executor: a task is already running")
 
 // cleanupTimeout bounds tearing a worktree down after the task ended.
 const cleanupTimeout = time.Minute
+
+// maxCapture is how much of a command's output is kept to hand back to the
+// agent. Everything is still streamed and journalled; this only bounds what one
+// tool result costs to send to the model.
+const maxCapture = 32 << 10
+
+// maxFileRead bounds one read_file. A file larger than this is not something to
+// put in a prompt whole.
+const maxFileRead = 256 << 10
 
 // Reporter is where a running task is announced. The channel implements it.
 //
@@ -49,6 +66,12 @@ type Config struct {
 	Repos *repo.Manager
 	Store *eventstore.Store
 	Agent agent.Agent
+	// LLM answers the agent's model calls. Nil is valid for an agent that does
+	// not use one, and any call from an agent that does is an error.
+	LLM *llm.Client
+	// BudgetUSD caps what one task may spend when the task itself names no
+	// budget. Zero means uncapped.
+	BudgetUSD float64
 	// Filter masks credential values in command output. Nil masks nothing,
 	// which is correct only when there are no credentials.
 	Filter *redact.Filter
@@ -138,8 +161,14 @@ func (e *Executor) Run(ctx context.Context, task protocol.TaskRun, rep Reporter)
 		e.mu.Unlock()
 	}()
 
+	budget := task.BudgetUSD
+	if budget <= 0 {
+		budget = e.cfg.BudgetUSD
+	}
+	sess := &session{ex: e, task: task, rep: rep, budget: budget}
+
 	start := time.Now()
-	err := e.execute(ctx, task, rep)
+	err := e.execute(ctx, task, rep, sess)
 	duration := time.Since(start)
 
 	// Reporting outlives the task's own context: a cancelled task still has to
@@ -157,7 +186,10 @@ func (e *Executor) Run(ctx context.Context, task protocol.TaskRun, rep Reporter)
 		e.state(reportCtx, task.TaskID, protocol.TaskFailed, err.Error(), rep)
 	}
 
+	cost, tokens := sess.totals()
 	if repErr := rep.TaskResult(reportCtx, task.TaskID, protocol.TaskResult{
+		CostUSD:    cost,
+		Tokens:     tokens,
 		DurationMs: duration.Milliseconds(),
 	}); repErr != nil {
 		e.log.Debug("could not report the result", "taskId", task.TaskID, "err", repErr)
@@ -165,9 +197,12 @@ func (e *Executor) Run(ctx context.Context, task protocol.TaskRun, rep Reporter)
 	return err
 }
 
-func (e *Executor) execute(ctx context.Context, task protocol.TaskRun, rep Reporter) error {
+func (e *Executor) execute(ctx context.Context, task protocol.TaskRun, rep Reporter, sess *session) error {
 	if task.Repo == "" {
 		return errors.New("executor: task has no repo")
+	}
+	if e.cfg.Agent == nil {
+		return errors.New("executor: no agent configured")
 	}
 
 	e.state(ctx, task.TaskID, protocol.TaskPreparing, "", rep)
@@ -194,14 +229,6 @@ func (e *Executor) execute(ctx context.Context, task protocol.TaskRun, rep Repor
 		}()
 	}
 
-	steps, err := e.cfg.Agent.Plan(ctx, task, worktree.Path)
-	if err != nil {
-		return err
-	}
-	if len(steps) == 0 {
-		return errors.New("executor: the agent produced no steps")
-	}
-
 	spec := e.cfg.Sandbox
 	spec.HostPath = worktree.Path
 	spec.Env = e.cfg.Env
@@ -212,58 +239,249 @@ func (e *Executor) execute(ctx context.Context, task protocol.TaskRun, rep Repor
 		spec.Timeout = time.Duration(task.TimeoutMs) * time.Millisecond
 	}
 
+	sess.spec = spec
+	sess.workDir = worktree.Path
+
 	e.state(ctx, task.TaskID, protocol.TaskRunning, "", rep)
 	e.emit(ctx, task.TaskID, protocol.EventStage, protocol.StagePayload{Name: "execute"}, rep)
 
-	for i, step := range steps {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := e.runStep(ctx, task.TaskID, i, step, spec, rep); err != nil {
-			return err
-		}
+	result, err := e.cfg.Agent.Run(ctx, task, sess)
+	if err != nil {
+		return err
 	}
+	e.log.Info("agent finished", "taskId", task.TaskID, "title", result.Title)
 	return nil
 }
 
-func (e *Executor) runStep(ctx context.Context, taskID string, index int, step agent.Step, spec sandbox.Spec, rep Reporter) error {
-	cmdID := fmt.Sprintf("c%d", index+1)
-	e.emit(ctx, taskID, protocol.EventCmdStart, protocol.CmdStartPayload{
+// session is the executor's side of agent.Session: the only surface an agent
+// gets, and the one every guarantee is enforced on.
+type session struct {
+	ex      *Executor
+	task    protocol.TaskRun
+	rep     Reporter
+	spec    sandbox.Spec
+	workDir string
+	budget  float64
+
+	mu     sync.Mutex
+	cmds   int
+	steps  int
+	cost   float64
+	tokens protocol.Tokens
+}
+
+func (s *session) WorkDir() string { return s.workDir }
+
+func (s *session) totals() (float64, protocol.Tokens) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cost, s.tokens
+}
+
+// Exec runs one command in a container and reports it as it goes.
+func (s *session) Exec(ctx context.Context, argv []string) (agent.Exec, error) {
+	if len(argv) == 0 {
+		return agent.Exec{}, errors.New("executor: no command")
+	}
+	if err := ctx.Err(); err != nil {
+		return agent.Exec{}, err
+	}
+
+	s.mu.Lock()
+	s.cmds++
+	cmdID := fmt.Sprintf("c%d", s.cmds)
+	s.mu.Unlock()
+
+	s.ex.emit(ctx, s.task.TaskID, protocol.EventCmdStart, protocol.CmdStartPayload{
 		CmdID: cmdID,
-		Argv:  step.Argv,
-		Dir:   spec.WorkDir,
-	}, rep)
+		Argv:  argv,
+		Dir:   s.spec.WorkDir,
+	}, s.rep)
 
-	stdout := e.output(ctx, taskID, cmdID, "stdout", rep)
-	stderr := e.output(ctx, taskID, cmdID, "stderr", rep)
+	// One buffer for both streams: the agent needs to read what happened in the
+	// order it happened, which is how a shell shows it.
+	captured := &capture{limit: maxCapture}
+	stdout := s.ex.output(ctx, s.task.TaskID, cmdID, "stdout", s.rep, captured)
+	stderr := s.ex.output(ctx, s.task.TaskID, cmdID, "stderr", s.rep, captured)
 
-	result, runErr := e.cfg.Run(ctx, spec, step.Argv, stdout, stderr)
+	result, runErr := s.ex.cfg.Run(ctx, s.spec, argv, stdout, stderr)
 
 	// The redaction writers hold back a tail so a credential cannot be split
 	// across two chunks; without these flushes that tail is simply lost.
 	stdout.Flush()
 	stderr.Flush()
 
-	e.emit(ctx, taskID, protocol.EventCmdExit, protocol.CmdExitPayload{
+	s.ex.emit(ctx, s.task.TaskID, protocol.EventCmdExit, protocol.CmdExitPayload{
 		CmdID:      cmdID,
 		Code:       result.ExitCode,
 		DurationMs: result.Duration.Milliseconds(),
-	}, rep)
+	}, s.rep)
 
 	if runErr != nil {
-		return runErr
+		return agent.Exec{}, runErr
 	}
-	if result.ExitCode != 0 {
-		return fmt.Errorf("executor: %s exited with code %d", step.Name, result.ExitCode)
+	text, truncated := captured.text()
+	return agent.Exec{
+		ExitCode:   result.ExitCode,
+		Output:     text,
+		Truncated:  truncated,
+		DurationMs: result.Duration.Milliseconds(),
+	}, nil
+}
+
+// ReadFile returns a file from the checkout, masked, because a model provider is
+// as much somewhere a credential should not go as Cloud is.
+func (s *session) ReadFile(name string) (string, error) {
+	full, err := s.path(name)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Open(full)
+	if err != nil {
+		// The host path is deliberately not repeated back: the agent works in
+		// repository-relative terms and does not need the VPS's layout.
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("%s does not exist", name)
+		}
+		return "", fmt.Errorf("cannot read %s", name)
+	}
+	defer f.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(f, maxFileRead))
+	if err != nil {
+		return "", fmt.Errorf("cannot read %s: %w", name, err)
+	}
+	return string(s.ex.cfg.Filter.Bytes(raw)), nil
+}
+
+// WriteFile replaces a file in the checkout.
+func (s *session) WriteFile(name, content string) error {
+	full, err := s.path(name)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return fmt.Errorf("cannot create the directory for %s: %w", name, err)
+	}
+	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		return fmt.Errorf("cannot write %s: %w", name, err)
 	}
 	return nil
 }
 
+// path resolves a repository-relative path, refusing anything that leaves the
+// checkout. The agent's reach is the worktree and nothing else on the VPS.
+func (s *session) path(name string) (string, error) {
+	if name == "" {
+		return "", errors.New("path is empty")
+	}
+	clean := filepath.Clean(filepath.FromSlash(name))
+	if !filepath.IsLocal(clean) {
+		return "", fmt.Errorf("path %q is outside the repository checkout", name)
+	}
+	return filepath.Join(s.workDir, clean), nil
+}
+
+// Complete calls the model, journals the call, and holds the budget.
+//
+// The check is made before the call rather than after, so a task stops instead
+// of paying for an answer it will not use. That lets a task overshoot its
+// budget by at most one call, which is the cheaper of the two mistakes.
+func (s *session) Complete(ctx context.Context, req llm.Request) (llm.Response, error) {
+	if s.ex.cfg.LLM == nil {
+		return llm.Response{}, errors.New("executor: no llm configured; set creds.llm in the runner config")
+	}
+
+	s.mu.Lock()
+	spent := s.cost
+	s.mu.Unlock()
+	if s.budget > 0 && spent >= s.budget {
+		return llm.Response{}, fmt.Errorf("%w: spent $%.4f of $%.4f", agent.ErrBudget, spent, s.budget)
+	}
+
+	resp, err := s.ex.cfg.LLM.Complete(ctx, req)
+	if err != nil {
+		return llm.Response{}, err
+	}
+
+	tokens := protocol.Tokens{
+		In:  resp.Usage.Input + resp.Usage.CacheRead + resp.Usage.CacheWrite,
+		Out: resp.Usage.Output,
+	}
+	s.mu.Lock()
+	s.cost += resp.CostUSD
+	s.tokens.In += tokens.In
+	s.tokens.Out += tokens.Out
+	s.mu.Unlock()
+
+	s.ex.emit(ctx, s.task.TaskID, protocol.EventLLMCall, protocol.LLMCallPayload{
+		Model:      resp.Model,
+		Tokens:     tokens,
+		CostUSD:    resp.CostUSD,
+		DurationMs: resp.Duration.Milliseconds(),
+	}, s.rep)
+	return resp, nil
+}
+
+// Step records what the agent said it is doing. The text is masked: it is the
+// model's own words, and the model has been reading the repository.
+func (s *session) Step(ctx context.Context, text string) {
+	if text == "" {
+		return
+	}
+	s.mu.Lock()
+	s.steps++
+	stepID := fmt.Sprintf("s%d", s.steps)
+	s.mu.Unlock()
+
+	s.ex.emit(ctx, s.task.TaskID, protocol.EventAgentStep, protocol.AgentStepPayload{
+		StepID: stepID,
+		Text:   s.ex.cfg.Filter.String(text),
+	}, s.rep)
+}
+
+// capture keeps the first limit bytes of a command's output for the agent.
+//
+// The start is kept rather than the end because it holds the first error, which
+// is usually the one that caused the rest.
+type capture struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+// Write never fails: it is one half of a MultiWriter whose other half is the
+// event stream, and dropping output must not stop a command.
+func (c *capture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if room := c.limit - c.buf.Len(); room > 0 {
+		if len(p) > room {
+			c.buf.Write(p[:room])
+			c.truncated = true
+		} else {
+			c.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		c.truncated = true
+	}
+	return len(p), nil
+}
+
+func (c *capture) text() (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String(), c.truncated
+}
+
 // output returns a writer that masks credentials and turns what survives into
-// cmd_output events.
-func (e *Executor) output(ctx context.Context, taskID, cmdID, stream string, rep Reporter) *outputWriter {
+// cmd_output events, keeping a bounded copy for the agent.
+func (e *Executor) output(ctx context.Context, taskID, cmdID, stream string, rep Reporter, captured *capture) *outputWriter {
 	sink := &chunkSink{ex: e, ctx: ctx, taskID: taskID, cmdID: cmdID, stream: stream, rep: rep}
-	return &outputWriter{masked: e.cfg.Filter.Writer(sink)}
+	// Masking happens first, so what the agent reads is what Cloud reads.
+	return &outputWriter{masked: e.cfg.Filter.Writer(io.MultiWriter(sink, captured))}
 }
 
 type outputWriter struct {

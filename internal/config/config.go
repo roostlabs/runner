@@ -42,6 +42,31 @@ type Config struct {
 	Creds Creds `json:"creds"`
 	// Sandbox configures how tasks are executed.
 	Sandbox Sandbox `json:"sandbox"`
+	// Agent configures the model that decides what to execute.
+	Agent Agent `json:"agent"`
+}
+
+// Agent configures the LLM-driven agent.
+//
+// It is used when creds.llm is set. Without that key the Runner falls back to
+// running sandbox.commands, because an agent with no model is not an agent.
+type Agent struct {
+	// Model is the model id. Empty uses the package default.
+	Model string `json:"model,omitempty"`
+	// Effort is how hard the model thinks per turn: low, medium, high, xhigh
+	// or max. Higher costs more per turn and usually needs fewer of them.
+	Effort string `json:"effort,omitempty"`
+	// MaxTokens caps one reply, thinking included.
+	MaxTokens int `json:"maxTokens,omitempty"`
+	// MaxSteps bounds the conversation. A task that has not finished by then
+	// is looping, and a loop with a token meter attached is expensive.
+	MaxSteps int `json:"maxSteps,omitempty"`
+	// BudgetUSD caps what one task may spend when Cloud sends no budget of its
+	// own. Zero leaves the task uncapped, which is a choice worth making
+	// deliberately.
+	BudgetUSD float64 `json:"budgetUsd,omitempty"`
+	// BaseURL overrides the API endpoint, for a proxy or a test.
+	BaseURL string `json:"baseUrl,omitempty"`
 }
 
 // Sandbox configures the containers tasks run in.

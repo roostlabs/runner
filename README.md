@@ -9,8 +9,9 @@ to read it is the evidence that nothing leaks upward.
 
 ## Status
 
-Early, but a task now runs end to end. What is missing is the part that decides:
-the commands come from the config file, not from an agent.
+Early, but a task now runs end to end and an agent decides what it does. What is
+missing is the last step: the work is left in the checkout rather than committed
+and opened as a pull request.
 
 Working today:
 
@@ -23,9 +24,13 @@ Working today:
 - append-only SQLite event journal with per-task sequence numbers
 - `task_history`, `task_trace` and `config` queries answered from that journal
 - one task at a time, cancellable, surviving a dropped channel
+- an agent that reads the ticket, explores the repository, edits files and runs
+  commands, through a session that cannot reach past the task's checkout
+- every model call priced and journalled as an `llm_call` event, and a budget
+  that stops the task rather than only reporting the overspend
 
-Next: an LLM-driven agent in place of the fixed command list, cost accounting
-from `llm_call` events, and opening the pull request under a service account.
+Next: committing what the agent left and opening the pull request under a
+service account with no merge rights.
 
 ## Build and run
 
@@ -50,13 +55,29 @@ The config is JSON and must be mode `0600`:
     "image": "golang:1.26",
     "commands": [["go", "build", "./..."], ["go", "test", "./..."]],
     "network": "bridge"
+  },
+  "agent": {
+    "model": "claude-opus-5",
+    "effort": "xhigh",
+    "maxSteps": 40,
+    "budgetUsd": 5
   }
 }
 ```
 
 `sandbox.image` has no default: which image a task needs is a property of the
-repository, not of the Runner. `sandbox.commands` are argv lists, not shell
-lines, and stand in until there is an agent to produce them.
+repository, not of the Runner.
+
+`creds.llm` is the switch. With it set, an agent decides what the task does.
+Without it the Runner falls back to running `sandbox.commands`, which is a real
+mode rather than a stub: a repository whose build and test sequence is fixed
+does not need a model to rediscover it every time. Those commands are argv
+lists, not shell lines.
+
+`agent.budgetUsd` caps a task when Cloud sends no budget of its own. Since what
+a call will cost is not knowable before making it, the check is made on what has
+already been spent, so a task can overshoot by one call and no more. Zero leaves
+it uncapped, which is worth deciding deliberately.
 
 `ROOST_CONFIG` overrides the config path, `ROOST_DATA_DIR` the data directory.
 
@@ -105,8 +126,9 @@ work. `"network": "none"` is available today for tasks that need nothing externa
 | `internal/repo` | persistent clones and per-task worktrees |
 | `internal/sandbox` | disposable containers under limits |
 | `internal/redact` | masks credential values in streamed output |
-| `internal/agent` | decides a task's steps; fixed for now |
-| `internal/executor` | runs a task and reports it throughout |
+| `internal/llm` | the Anthropic Messages API, and what a call cost |
+| `internal/agent` | decides a task's work; a model, or a fixed command list |
+| `internal/executor` | runs a task, reports it throughout, and holds the budget |
 
 The wire contract lives in [roostlabs/protocol](https://github.com/roostlabs/protocol).
 
@@ -117,6 +139,11 @@ can drop onto a box:
 
 - `github.com/coder/websocket`
 - `modernc.org/sqlite`
+
+The Anthropic client is not among them. `internal/llm` speaks the HTTP API
+directly, because the Runner uses a narrow slice of it — one endpoint, tool use,
+and the token counts budgets are built from — and that slice is smaller than the
+dependency would be.
 
 ## Tests
 
