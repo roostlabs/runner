@@ -1,10 +1,10 @@
 // Command runner is the Roost task runner. It runs on the developer's own VPS,
 // dials out to Cloud, and executes tasks in disposable Docker sandboxes.
 //
-// What it does not do yet is decide anything: the steps a task runs come from
-// the config file rather than from an agent. Everything around that decision —
-// the persistent clone, the clean worktree, the container limits, the redacted
-// output, the journal — is real.
+// What it does not do yet is the last step: the work an agent finishes is left
+// in the task's checkout rather than committed and opened as a pull request.
+// Everything before that — the persistent clone, the clean worktree, the
+// container limits, the redacted output, the journal, the budget — is real.
 package main
 
 import (
@@ -29,6 +29,7 @@ import (
 	"github.com/roostlabs/runner/internal/config"
 	"github.com/roostlabs/runner/internal/eventstore"
 	"github.com/roostlabs/runner/internal/executor"
+	"github.com/roostlabs/runner/internal/llm"
 	"github.com/roostlabs/runner/internal/redact"
 	"github.com/roostlabs/runner/internal/repo"
 	"github.com/roostlabs/runner/internal/sandbox"
@@ -87,6 +88,11 @@ func run() error {
 		log.Warn("no docker daemon detected; tasks will fail until one is running")
 	}
 
+	brain, model, err := newAgent(cfg)
+	if err != nil {
+		return err
+	}
+
 	repos := repo.New(filepath.Join(cfg.DataDir, "repos"), cfg.Creds.Git)
 	svc := &service{
 		ctx:   ctx,
@@ -96,9 +102,11 @@ func run() error {
 		log:   log,
 	}
 	svc.exec = executor.New(executor.Config{
-		Repos: repos,
-		Store: store,
-		Agent: agent.FixedFromArgv(cfg.Sandbox.Commands),
+		Repos:     repos,
+		Store:     store,
+		Agent:     brain,
+		LLM:       model,
+		BudgetUSD: cfg.Agent.BudgetUSD,
 		// The filter can only mask values it was told about, which is exactly
 		// the set the sandbox is given.
 		Filter:       redact.New(cfg.Creds.Values()...),
@@ -112,7 +120,8 @@ func run() error {
 	log.Info("runner starting",
 		"version", Version, "cloud", cfg.CloudURL, "dataDir", cfg.DataDir,
 		"creds", cfg.Creds, "docker", docker, "image", cfg.Sandbox.Image,
-		"steps", len(cfg.Sandbox.Commands))
+		"agent", agentKind(model), "model", modelName(model),
+		"budgetUsd", cfg.Agent.BudgetUSD)
 
 	return channel.Run(ctx, channel.Options{
 		URL:           cfg.CloudURL,
@@ -126,6 +135,43 @@ func run() error {
 		OnConnect: svc.onConnect,
 		Logger:    log,
 	}, svc.handle)
+}
+
+// newAgent picks what decides a task's work.
+//
+// An LLM key is what makes the Runner an agent rather than a build server, so
+// its presence is the switch. Without one the configured commands still run,
+// which is a real mode: a repository whose build and test sequence is fixed
+// does not need a model to rediscover it every time.
+func newAgent(cfg config.Config) (agent.Agent, *llm.Client, error) {
+	if cfg.Creds.LLM == "" {
+		return agent.FixedFromArgv(cfg.Sandbox.Commands), nil, nil
+	}
+	client, err := llm.New(llm.Options{
+		APIKey:    cfg.Creds.LLM,
+		BaseURL:   cfg.Agent.BaseURL,
+		Model:     cfg.Agent.Model,
+		Effort:    cfg.Agent.Effort,
+		MaxTokens: cfg.Agent.MaxTokens,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return agent.Model{MaxSteps: cfg.Agent.MaxSteps}, client, nil
+}
+
+func agentKind(model *llm.Client) string {
+	if model == nil {
+		return "fixed"
+	}
+	return "model"
+}
+
+func modelName(model *llm.Client) string {
+	if model == nil {
+		return ""
+	}
+	return model.Model()
 }
 
 // sandboxSpec maps the config onto a container spec. WritableRoot is negated
@@ -290,6 +336,11 @@ func (s *service) startTask(task protocol.TaskRun, ref string) {
 			// failure. Cloud decides whether to retry.
 			s.log.Info("refusing task: already busy", "taskId", task.TaskID)
 			s.sendError(ref, protocol.ErrBusy, err.Error())
+		case errors.Is(err, agent.ErrBudget):
+			// The task stopped because it ran out of money, which Cloud shows
+			// differently from a task that broke.
+			s.log.Warn("task stopped on budget", "taskId", task.TaskID, "err", err)
+			s.sendError(ref, protocol.ErrBudgetExceeded, err.Error())
 		default:
 			s.log.Warn("task failed", "taskId", task.TaskID, "err", err)
 		}

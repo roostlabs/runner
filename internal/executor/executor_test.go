@@ -180,11 +180,14 @@ func TestRunReportsAFullTrace(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// Two stages, then start/output/exit for each of the two commands.
+	// Two stages, then for each of the two commands: what the agent said it
+	// was doing, and the command's own start/output/exit.
 	wantKinds := []protocol.EventKind{
 		protocol.EventStage,
 		protocol.EventStage,
+		protocol.EventAgentStep,
 		protocol.EventCmdStart, protocol.EventCmdOutput, protocol.EventCmdExit,
+		protocol.EventAgentStep,
 		protocol.EventCmdStart, protocol.EventCmdOutput, protocol.EventCmdExit,
 	}
 	if got := f.kindsMatch(rec, wantKinds); !got {
