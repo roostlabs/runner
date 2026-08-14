@@ -15,6 +15,7 @@ import (
 
 	"github.com/roostlabs/protocol"
 	"github.com/roostlabs/runner/internal/agent"
+	"github.com/roostlabs/runner/internal/forge"
 	"github.com/roostlabs/runner/internal/llm"
 	"github.com/roostlabs/runner/internal/redact"
 	"github.com/roostlabs/runner/internal/sandbox"
@@ -26,6 +27,11 @@ type funcAgent func(ctx context.Context, task protocol.TaskRun, s agent.Session)
 
 func (f funcAgent) Run(ctx context.Context, task protocol.TaskRun, s agent.Session) (agent.Result, error) {
 	return f(ctx, task, s)
+}
+
+// noForge stands in where a test changes files but is not about publishing.
+func noForge(context.Context, forge.Request) (forge.PR, error) {
+	return forge.PR{URL: "https://example.com/pull/1"}, nil
 }
 
 // stubAPI answers every call with one end_turn reply, counting the calls.
@@ -100,6 +106,7 @@ func TestSessionReadsAndWritesTheCheckout(t *testing.T) {
 	)
 	f := newFixture(t, Config{
 		KeepWorktree: true, // so the file can be checked after the task
+		Forge:        noForge,
 		Agent: funcAgent(func(_ context.Context, _ protocol.TaskRun, s agent.Session) (agent.Result, error) {
 			workDir = s.WorkDir()
 			if err := s.WriteFile("internal/pager/pager.go", "package pager\n"); err != nil {
@@ -135,6 +142,7 @@ func TestSessionMasksWhatTheAgentReads(t *testing.T) {
 	f := newFixture(t, Config{
 		Filter:       redact.New(secret),
 		KeepWorktree: true,
+		Forge:        noForge,
 		Run: func(_ context.Context, _ sandbox.Spec, _ []string, stdout, _ io.Writer) (sandbox.Result, error) {
 			stdout.Write([]byte("token=" + secret + "\n"))
 			return sandbox.Result{ExitCode: 0}, nil
