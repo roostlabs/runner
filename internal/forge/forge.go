@@ -6,8 +6,10 @@
 // Nothing here can merge anything, and the token it uses should not be able to
 // either.
 //
-// GitHub is the only forge implemented. Another one is a matter of another file
-// in this package, not of a different design.
+// GitHub and GitLab are both implemented. Which one a repository lives on is
+// read from its remote when the host says so, and configured when it does not —
+// a self-hosted forge is not something to guess at, because a wrong guess
+// pushes a branch and then fails to open anything on top of it.
 package forge
 
 import (
@@ -23,11 +25,21 @@ import (
 	"time"
 )
 
-// DefaultAPIBase is GitHub's API.
-const DefaultAPIBase = "https://api.github.com"
+// Kind names a forge.
+type Kind string
 
 const (
-	apiVersion       = "2022-11-28"
+	KindGitHub Kind = "github"
+	KindGitLab Kind = "gitlab"
+)
+
+// Default API roots. A self-hosted forge overrides these through Options.
+const (
+	DefaultGitHubAPI = "https://api.github.com"
+	DefaultGitLabAPI = "https://gitlab.com"
+)
+
+const (
 	maxResponseBytes = 1 << 20
 	defaultTimeout   = time.Minute
 )
@@ -45,7 +57,8 @@ type Request struct {
 	Body  string
 }
 
-// PR is an opened pull request.
+// PR is an opened pull request. GitLab calls it a merge request; the number is
+// its iid, which is what appears in the URL.
 type PR struct {
 	Number int
 	URL    string
@@ -59,15 +72,22 @@ type Options struct {
 	// Token is the service account's. It needs to write the repository and
 	// open pull requests, and should not be able to merge them.
 	Token string
-	// APIBase overrides the endpoint, for GitHub Enterprise.
+	// Kind forces the forge. Empty reads it from the remote's host, which only
+	// works for the hosted services: a self-hosted GitLab is just a hostname.
+	Kind Kind
+	// APIBase overrides the API root. For GitHub Enterprise that includes the
+	// path, e.g. https://git.example.com/api/v3; for a self-hosted GitLab it
+	// does not, e.g. https://git.example.com, because GitLab's own paths start
+	// with /api/v4.
 	APIBase string
 	HTTP    *http.Client
 }
 
-// Client opens pull requests on GitHub.
+// Client opens pull requests.
 type Client struct {
 	http    *http.Client
 	token   string
+	kind    Kind
 	apiBase string
 }
 
@@ -76,13 +96,17 @@ func New(o Options) (*Client, error) {
 	if o.Token == "" {
 		return nil, errors.New("forge: no git token; set creds.git in the runner config")
 	}
+	switch o.Kind {
+	case "", KindGitHub, KindGitLab:
+	default:
+		return nil, fmt.Errorf("forge: unknown forge %q; use %q or %q", o.Kind, KindGitHub, KindGitLab)
+	}
+
 	c := &Client{
 		http:    o.HTTP,
 		token:   o.Token,
+		kind:    o.Kind,
 		apiBase: strings.TrimSuffix(o.APIBase, "/"),
-	}
-	if c.apiBase == "" {
-		c.apiBase = DefaultAPIBase
 	}
 	if c.http == nil {
 		c.http = &http.Client{Timeout: defaultTimeout}
@@ -92,7 +116,7 @@ func New(o Options) (*Client, error) {
 
 // Open opens the pull request, or finds the one a previous attempt left.
 func (c *Client) Open(ctx context.Context, req Request) (PR, error) {
-	owner, name, err := Repository(req.RemoteURL)
+	remote, err := Parse(req.RemoteURL)
 	if err != nil {
 		return PR{}, err
 	}
@@ -103,77 +127,152 @@ func (c *Client) Open(ctx context.Context, req Request) (PR, error) {
 		return PR{}, errors.New("forge: a pull request needs a title")
 	}
 
-	body, err := json.Marshal(map[string]any{
-		"title": req.Title,
-		"head":  req.Head,
-		"base":  req.Base,
-		"body":  req.Body,
-	})
+	kind, err := c.kindFor(remote)
 	if err != nil {
-		return PR{}, fmt.Errorf("forge: encode request: %w", err)
+		return PR{}, err
+	}
+	switch kind {
+	case KindGitHub:
+		return c.openGitHub(ctx, remote, req)
+	case KindGitLab:
+		return c.openGitLab(ctx, remote, req)
+	default:
+		return PR{}, fmt.Errorf("forge: %q is not implemented", kind)
+	}
+}
+
+// kindFor decides which forge a remote is on.
+//
+// The hosted services are known by name. Anything else has to be configured:
+// guessing from a hostname would push a branch and then fail to open a pull
+// request on it, which is a worse failure than refusing up front.
+func (c *Client) kindFor(remote Remote) (Kind, error) {
+	if c.kind != "" {
+		return c.kind, nil
+	}
+	switch remote.Host {
+	case "github.com", "www.github.com":
+		return KindGitHub, nil
+	case "gitlab.com", "www.gitlab.com":
+		return KindGitLab, nil
+	default:
+		return "", fmt.Errorf(
+			"forge: cannot tell which forge %s is; set git.forge to %q or %q in the runner config",
+			remote.Host, KindGitHub, KindGitLab)
+	}
+}
+
+func (c *Client) base(kind Kind) string {
+	if c.apiBase != "" {
+		return c.apiBase
+	}
+	if kind == KindGitLab {
+		return DefaultGitLabAPI
+	}
+	return DefaultGitHubAPI
+}
+
+// Remote is a repository as its git remote names it.
+type Remote struct {
+	// Host is the forge's hostname, without any userinfo or port.
+	Host string
+	// Path is everything below the host, without a .git suffix. GitLab
+	// subgroups make this more than two segments, which is why it is kept whole
+	// rather than split into an owner and a name.
+	Path string
+}
+
+// Owner is the first path segment: a user, an organisation, or a top-level
+// GitLab group.
+func (r Remote) Owner() string {
+	owner, _, _ := strings.Cut(r.Path, "/")
+	return owner
+}
+
+// Name is the last path segment: the repository itself.
+func (r Remote) Name() string {
+	if i := strings.LastIndex(r.Path, "/"); i >= 0 {
+		return r.Path[i+1:]
+	}
+	return r.Path
+}
+
+// Parse picks the host and the repository path out of a git remote.
+//
+// Both the https and the ssh forms are accepted, because which one a repository
+// was cloned with says nothing about which forge it lives on.
+func Parse(remote string) (Remote, error) {
+	trimmed := strings.TrimSpace(remote)
+	if trimmed == "" {
+		return Remote{}, errors.New("forge: no remote url")
 	}
 
-	path := fmt.Sprintf("/repos/%s/%s/pulls", url.PathEscape(owner), url.PathEscape(name))
-	raw, status, err := c.do(ctx, http.MethodPost, path, body)
+	var host, path string
 	switch {
-	case err == nil:
-		var created struct {
-			Number  int    `json:"number"`
-			HTMLURL string `json:"html_url"`
+	case strings.HasPrefix(trimmed, "http://"), strings.HasPrefix(trimmed, "https://"),
+		strings.HasPrefix(trimmed, "ssh://"), strings.HasPrefix(trimmed, "git://"):
+		u, err := url.Parse(trimmed)
+		if err != nil {
+			return Remote{}, fmt.Errorf("forge: remote %q: %w", remote, err)
 		}
-		if err := json.Unmarshal(raw, &created); err != nil {
-			return PR{}, fmt.Errorf("forge: decode response: %w", err)
-		}
-		return PR{Number: created.Number, URL: created.HTMLURL}, nil
+		host, path = u.Hostname(), u.Path
 
-	case status == http.StatusUnprocessableEntity:
-		// The likeliest cause is a retried task whose branch already has a pull
-		// request. Finding it is more useful than reporting a conflict.
-		if pr, found := c.find(ctx, owner, name, req.Head); found {
-			return pr, nil
+	case strings.Contains(trimmed, ":"):
+		// The scp-like form: git@github.com:group/sub/project.git
+		hostPart, rest, _ := strings.Cut(trimmed, ":")
+		if _, after, found := strings.Cut(hostPart, "@"); found {
+			hostPart = after
 		}
-		return PR{}, err
+		host, path = hostPart, rest
 
 	default:
-		return PR{}, err
+		return Remote{}, fmt.Errorf("forge: cannot tell the host from %q", remote)
 	}
+
+	host = strings.ToLower(strings.TrimSpace(host))
+	path = strings.TrimSuffix(strings.Trim(path, "/"), ".git")
+
+	if host == "" {
+		return Remote{}, fmt.Errorf("forge: remote %q has no host", remote)
+	}
+	segments := strings.Split(path, "/")
+	if len(segments) < 2 {
+		return Remote{}, fmt.Errorf("forge: %q does not name a repository", remote)
+	}
+	for _, segment := range segments {
+		if segment == "" {
+			return Remote{}, fmt.Errorf("forge: %q has an empty path segment", remote)
+		}
+	}
+	return Remote{Host: host, Path: path}, nil
 }
 
-// find looks for an open pull request from head.
-func (c *Client) find(ctx context.Context, owner, name, head string) (PR, bool) {
-	query := url.Values{}
-	query.Set("head", owner+":"+head)
-	query.Set("state", "open")
-	path := fmt.Sprintf("/repos/%s/%s/pulls?%s",
-		url.PathEscape(owner), url.PathEscape(name), query.Encode())
-
-	raw, _, err := c.do(ctx, http.MethodGet, path, nil)
-	if err != nil {
-		return PR{}, false
-	}
-	var found []struct {
-		Number  int    `json:"number"`
-		HTMLURL string `json:"html_url"`
-	}
-	if err := json.Unmarshal(raw, &found); err != nil || len(found) == 0 {
-		return PR{}, false
-	}
-	return PR{Number: found[0].Number, URL: found[0].HTMLURL, Existed: true}, true
+// call is one API request.
+type call struct {
+	method  string
+	url     string
+	body    []byte
+	headers map[string]string
+	// explain turns an error body into one line. The forges disagree about the
+	// shape of those, so each provides its own.
+	explain func(raw []byte, status int) string
 }
 
-func (c *Client) do(ctx context.Context, method, path string, body []byte) ([]byte, int, error) {
+// send performs a call and reports the status alongside the error, because
+// which status came back is how a duplicate is told from a real failure.
+func (c *Client) send(ctx context.Context, call call) ([]byte, int, error) {
 	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
+	if call.body != nil {
+		reader = bytes.NewReader(call.body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.apiBase+path, reader)
+	req, err := http.NewRequestWithContext(ctx, call.method, call.url, reader)
 	if err != nil {
 		return nil, 0, fmt.Errorf("forge: %w", err)
 	}
-	req.Header.Set("accept", "application/vnd.github+json")
-	req.Header.Set("x-github-api-version", apiVersion)
-	req.Header.Set("authorization", "Bearer "+c.token)
-	if body != nil {
+	for name, value := range call.headers {
+		req.Header.Set(name, value)
+	}
+	if call.body != nil {
 		req.Header.Set("content-type", "application/json")
 	}
 
@@ -188,61 +287,22 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) ([]by
 		return nil, resp.StatusCode, fmt.Errorf("forge: read response: %w", err)
 	}
 	if resp.StatusCode >= 300 {
-		return raw, resp.StatusCode, fmt.Errorf("forge: %s %s: %s", method, path, explain(raw, resp.StatusCode))
+		// The path, not the full URL: an API base can carry credentials in its
+		// userinfo, and this error is journalled and streamed.
+		path := call.url
+		if u, parseErr := url.Parse(call.url); parseErr == nil {
+			path = u.Path
+		}
+		return raw, resp.StatusCode, fmt.Errorf("forge: %s %s: %s",
+			call.method, path, call.explain(raw, resp.StatusCode))
 	}
 	return raw, resp.StatusCode, nil
 }
 
-// explain turns GitHub's error body into one line, without repeating anything
-// that was sent.
-func explain(raw []byte, status int) string {
-	var body struct {
-		Message string `json:"message"`
-		Errors  []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
+func encodeBody(v any) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("forge: encode request: %w", err)
 	}
-	if err := json.Unmarshal(raw, &body); err != nil || body.Message == "" {
-		return fmt.Sprintf("http %d", status)
-	}
-
-	parts := []string{body.Message}
-	for _, e := range body.Errors {
-		if e.Message != "" {
-			parts = append(parts, e.Message)
-		}
-	}
-	return fmt.Sprintf("http %d: %s", status, strings.Join(parts, "; "))
-}
-
-// Repository picks the owner and name out of a git remote.
-//
-// Both the https and the ssh forms are accepted, because which one a repository
-// was cloned with says nothing about which forge it lives on.
-func Repository(remote string) (owner, name string, err error) {
-	trimmed := strings.TrimSpace(remote)
-	if trimmed == "" {
-		return "", "", errors.New("forge: no remote url")
-	}
-
-	path := trimmed
-	switch {
-	case strings.HasPrefix(trimmed, "http://"), strings.HasPrefix(trimmed, "https://"),
-		strings.HasPrefix(trimmed, "ssh://"), strings.HasPrefix(trimmed, "git://"):
-		u, parseErr := url.Parse(trimmed)
-		if parseErr != nil {
-			return "", "", fmt.Errorf("forge: remote %q: %w", remote, parseErr)
-		}
-		path = u.Path
-	case strings.Contains(trimmed, ":"):
-		// The scp-like form: git@github.com:owner/name.git
-		path = trimmed[strings.Index(trimmed, ":")+1:]
-	}
-
-	path = strings.TrimSuffix(strings.Trim(path, "/"), ".git")
-	parts := strings.Split(path, "/")
-	if len(parts) < 2 || parts[len(parts)-1] == "" || parts[len(parts)-2] == "" {
-		return "", "", fmt.Errorf("forge: cannot tell the owner and repository from %q", remote)
-	}
-	return parts[len(parts)-2], parts[len(parts)-1], nil
+	return raw, nil
 }

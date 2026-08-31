@@ -183,6 +183,7 @@ func newForge(cfg config.Config) (executor.PRFunc, error) {
 	}
 	client, err := forge.New(forge.Options{
 		Token:   cfg.Creds.Git,
+		Kind:    forge.Kind(cfg.Git.Forge),
 		APIBase: cfg.Git.APIBase,
 	})
 	if err != nil {
