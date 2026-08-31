@@ -1,4 +1,6 @@
 /runner
+/roost-runner
+/dist/
 *.test
 *.out
 *.db
