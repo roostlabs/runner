@@ -98,7 +98,9 @@ The config is JSON and must be mode `0600`:
   },
   "git": {
     "authorName": "Roost",
-    "authorEmail": "roost@example.com"
+    "authorEmail": "roost@example.com",
+    "forge": "gitlab",
+    "apiBase": "https://git.example.com"
   }
 }
 ```
@@ -111,6 +113,15 @@ Without it the Runner falls back to running `sandbox.commands`, which is a real
 mode rather than a stub: a repository whose build and test sequence is fixed
 does not need a model to rediscover it every time. Those commands are argv
 lists, not shell lines.
+
+`git.forge` is `github` or `gitlab`. Leave it empty for github.com and
+gitlab.com, which are recognised by hostname. A self-hosted forge has to say
+which one it is: guessing from a hostname would push a branch and then fail to
+open anything on it, which is a worse failure than refusing before the push.
+
+`git.apiBase` overrides the API root. For GitHub Enterprise it includes the
+path — `https://git.example.com/api/v3` — and for a self-hosted GitLab it does
+not, because GitLab's own paths already start with `/api/v4`.
 
 `agent.budgetUsd` caps a task when Cloud sends no budget of its own. Since what
 a call will cost is not knowable before making it, the check is made on what has
@@ -151,7 +162,8 @@ them on the host, outside the container everything else is confined to.
 **A pull request, never a merge.** The work lands on a branch under `roost/` and
 is opened for review by a service account. That account needs to push and to
 open pull requests; it should not be able to merge one. Nothing in the Runner
-can, either.
+can, either — on GitLab it explicitly declines to remove the source branch,
+because that branch is the task's output.
 
 ### The open risk
 
@@ -172,7 +184,7 @@ work. `"network": "none"` is available today for tasks that need nothing externa
 | `internal/sandbox` | disposable containers under limits |
 | `internal/redact` | masks credential values in streamed output |
 | `internal/llm` | the Anthropic Messages API, and what a call cost |
-| `internal/forge` | opens the pull request the work becomes |
+| `internal/forge` | opens the pull request the work becomes, on GitHub or GitLab |
 | `internal/agent` | decides a task's work; a model, or a fixed command list |
 | `internal/executor` | runs a task, reports it throughout, and holds the budget |
 | `install.sh` | the one-liner installer: prerequisites, service account, systemd unit |

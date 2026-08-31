@@ -76,6 +76,42 @@ func TestSandboxSettingsRoundTrip(t *testing.T) {
 	}
 }
 
+// The git settings decide where a task's work is published and who it is
+// attributed to, so one that survived a round trip only partly would open the
+// pull request somewhere unexpected.
+func TestGitAndAgentSettingsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	want := validConfig()
+	want.Git = Git{
+		AuthorName:  "Roost",
+		AuthorEmail: "roost@example.com",
+		Forge:       "gitlab",
+		APIBase:     "https://git.example.com",
+	}
+	want.Agent = Agent{
+		Model:     "claude-opus-5",
+		Effort:    "xhigh",
+		MaxTokens: 32000,
+		MaxSteps:  25,
+		BudgetUSD: 2.5,
+		BaseURL:   "https://llm.example.com",
+	}
+	if err := Save(path, want); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !reflect.DeepEqual(got.Git, want.Git) {
+		t.Errorf("git round trip = %+v, want %+v", got.Git, want.Git)
+	}
+	if !reflect.DeepEqual(got.Agent, want.Agent) {
+		t.Errorf("agent round trip = %+v, want %+v", got.Agent, want.Agent)
+	}
+}
+
 // A config that says nothing about the root filesystem must produce a read-only
 // one, so the safe setting is the one you get by default.
 func TestWritableRootDefaultsToFalse(t *testing.T) {

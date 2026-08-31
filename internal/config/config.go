@@ -55,7 +55,14 @@ type Git struct {
 	// theirs would put their name on work they have not read yet.
 	AuthorName  string `json:"authorName,omitempty"`
 	AuthorEmail string `json:"authorEmail,omitempty"`
-	// APIBase overrides the forge's API endpoint, for GitHub Enterprise.
+	// Forge is "github" or "gitlab". Empty reads it from the repository's
+	// remote, which only works for the hosted services: a self-hosted GitLab is
+	// just a hostname, and guessing would push a branch and then fail to open
+	// anything on it.
+	Forge string `json:"forge,omitempty"`
+	// APIBase overrides the forge's API endpoint. For GitHub Enterprise that
+	// includes the path, e.g. https://git.example.com/api/v3; for a self-hosted
+	// GitLab it does not, because GitLab's own paths start with /api/v4.
 	APIBase string `json:"apiBase,omitempty"`
 }
 
