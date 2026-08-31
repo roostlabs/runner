@@ -32,11 +32,45 @@ Working today:
 Not there yet: metrics, human approval mid-task, and any forge other than
 GitHub.
 
+## Install
+
+On a Linux box with Docker, from the dashboard's one-liner:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/roostlabs/runner/main/install.sh \
+  | sh -s -- --token=<from the dashboard> --cloud-url=wss://<cloud>/channel
+```
+
+It checks for Docker, creates a `roost` service account, installs the binary,
+writes `/etc/roost/config.json` at mode `0600` owned by that account, and starts
+a systemd unit. `--dry-run` prints every step and changes nothing; `--help`
+lists the rest.
+
+Two things it deliberately will not do. It refuses a `ws://` URL to a remote
+host, because the token would cross the network in clear text. And it never
+overwrites an existing config without `--force-config`, because that file holds
+every credential on the box — a one-liner pasted twice must not wipe them.
+
+A token passed as an argument is visible in the process list for as long as the
+installer runs. On a machine where that matters, use `--token-file=<path>` or
+the `ROOST_TOKEN` environment variable.
+
+The systemd unit runs as the service account with `NoNewPrivileges`,
+`ProtectSystem=strict`, `ProtectHome`, and the data directory as its only
+writable path. It requires `docker.service`, because a task with no container
+has nowhere to run.
+
+macOS and Windows are not supported by the installer, and whether they ever
+should be is still open. Build and run the binary directly there.
+
 ## Build and run
 
 ```bash
-go build ./cmd/runner
-./runner -config /etc/roost/config.json
+make build                 # ./roost-runner, static, version stamped
+./roost-runner -config /etc/roost/config.json
+make check                 # gofmt, vet, race tests
+make dist                  # release tarballs with checksums, linux/amd64 and arm64
+make lint-install          # shellcheck install.sh, in a container
 ```
 
 The config is JSON and must be mode `0600`:
@@ -141,6 +175,8 @@ work. `"network": "none"` is available today for tasks that need nothing externa
 | `internal/forge` | opens the pull request the work becomes |
 | `internal/agent` | decides a task's work; a model, or a fixed command list |
 | `internal/executor` | runs a task, reports it throughout, and holds the budget |
+| `install.sh` | the one-liner installer: prerequisites, service account, systemd unit |
+| `packaging` | tests that run the installer in a throwaway container |
 
 The wire contract lives in [roostlabs/protocol](https://github.com/roostlabs/protocol).
 
@@ -162,6 +198,11 @@ dependency would be.
 ```bash
 go test -race ./...
 ```
+
+The installer is tested by running it: a throwaway Debian container, a
+cross-compiled binary, and `docker` and `systemctl` stubbed out, asserting the
+file modes, the ownership, the unit's contents, and that a second run leaves an
+existing config alone. Those tests are skipped when no Docker daemon answers.
 
 The channel tests run against a stub Cloud and the repo tests against a local
 git repository, so neither needs a network. The sandbox tests that need a real
