@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/roostlabs/protocol"
@@ -37,7 +38,12 @@ const gitTimeout = 10 * time.Minute
 
 // Manager owns the repository directory under the Runner's data directory.
 type Manager struct {
-	root  string
+	root string
+
+	// mu guards the token, which Managed mode can replace while the Runner is
+	// running. Every git invocation reads it, and those come from task
+	// goroutines as well as from status queries.
+	mu    sync.RWMutex
 	token string
 }
 
@@ -47,6 +53,20 @@ type Manager struct {
 // environment, never through the command line.
 func New(root, token string) *Manager {
 	return &Manager{root: root, token: token}
+}
+
+// SetToken replaces the git credential. An empty token leaves the Manager
+// unauthenticated, which is what clearing a revoked one has to mean.
+func (m *Manager) SetToken(token string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.token = token
+}
+
+func (m *Manager) gitToken() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.token
 }
 
 // Repo is one prepared clone on disk.
@@ -256,7 +276,11 @@ func (m *Manager) git(ctx context.Context, dir string, args ...string) (string, 
 	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
 	defer cancel()
 
-	full := append(m.configArgs(), args...)
+	// The token is read once per invocation and threaded through, so a Managed
+	// mode swap cannot leave the helper configured for one value and the
+	// environment holding another.
+	token := m.gitToken()
+	full := append(m.configArgs(token), args...)
 	if dir != "" {
 		full = append([]string{"-C", dir}, full...)
 	}
@@ -268,8 +292,8 @@ func (m *Manager) git(ctx context.Context, dir string, args ...string) (string, 
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS=",
 	)
-	if m.token != "" {
-		cmd.Env = append(cmd.Env, "ROOST_GIT_TOKEN="+m.token)
+	if token != "" {
+		cmd.Env = append(cmd.Env, "ROOST_GIT_TOKEN="+token)
 	}
 
 	out, err := cmd.CombinedOutput()
@@ -293,9 +317,9 @@ func (m *Manager) git(ctx context.Context, dir string, args ...string) (string, 
 // value out of the environment, so what lands in ps is the snippet, not the
 // credential. The empty helper first clears any inherited one, so a keychain or
 // store on the host cannot answer instead and quietly use the wrong identity.
-func (m *Manager) configArgs() []string {
+func (m *Manager) configArgs(token string) []string {
 	args := []string{"-c", "core.hooksPath=/dev/null"}
-	if m.token == "" {
+	if token == "" {
 		return args
 	}
 	return append(args,

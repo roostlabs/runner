@@ -81,6 +81,7 @@ The config is JSON and must be mode `0600`:
   "token": "<from the dashboard>",
   "dataDir": "/var/lib/roost",
   "creds": {
+    "mode": "local",
     "git": "...",
     "taskManager": "...",
     "llm": "..."
@@ -107,6 +108,23 @@ The config is JSON and must be mode `0600`:
 
 `sandbox.image` has no default: which image a task needs is a property of the
 repository, not of the Runner.
+
+`creds.mode` is `local` or `managed`, and an empty value means `local`.
+
+In Local mode — the default and the recommendation — the values above are yours
+to set on this machine. Cloud is told which slots are filled and nothing else,
+and a credential arriving down the channel is refused rather than written.
+
+In Managed mode you can paste a credential into the dashboard and it is relayed
+down to this config instead. It buys you not needing shell access to rotate a
+token; it costs you the value transiting Cloud on the way here, which Local mode
+never does. That is why the switch is in this file rather than in the dashboard:
+the transit is your decision, and Cloud granting itself the permission would not
+be a permission. Changing the mode needs a restart. A credential change does not:
+it is written to this file at `0600` and applied to the next task. A task already
+running keeps the credentials it started with, and blocks the change until it
+finishes — otherwise it would push as one identity and open a pull request as
+another. An empty value clears a slot, which is how a revoked token is retired.
 
 `creds.llm` is the switch. With it set, an agent decides what the task does.
 Without it the Runner falls back to running `sandbox.commands`, which is a real

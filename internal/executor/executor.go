@@ -66,33 +66,59 @@ type RunFunc func(ctx context.Context, spec sandbox.Spec, argv []string, stdout,
 // PRFunc opens a pull request. It is a field for the same reason RunFunc is.
 type PRFunc func(ctx context.Context, req forge.Request) (forge.PR, error)
 
-// Config assembles an Executor.
-type Config struct {
-	Repos *repo.Manager
-	Store *eventstore.Store
+// Creds are the parts of a task that a credential decides.
+//
+// They are resolved when a task starts rather than when the Executor is built,
+// because Managed mode replaces credentials while the Runner is running. A task
+// already under way keeps the set it began with: swapping a token halfway would
+// leave it pushing as one identity and opening a pull request as another.
+type Creds struct {
+	// Agent decides the task's work. Which agent it is follows from the
+	// credentials too: without a model key there is no model to think with.
 	Agent agent.Agent
 	// LLM answers the agent's model calls. Nil is valid for an agent that does
 	// not use one, and any call from an agent that does is an error.
 	LLM *llm.Client
-	// BudgetUSD caps what one task may spend when the task itself names no
-	// budget. Zero means uncapped.
-	BudgetUSD float64
 	// Forge opens the pull request a finished task becomes. Nil means a task
 	// that changed something has nowhere to put it, which is reported as an
 	// error rather than left as a commit nobody will see.
 	Forge PRFunc
+	// Filter masks credential values in everything that leaves the box. Nil
+	// masks nothing, which is correct only when there are no credentials.
+	Filter *redact.Filter
+	// Env are the credentials to expose to the sandbox, as KEY=VALUE.
+	Env []string
+}
+
+// Config assembles an Executor.
+type Config struct {
+	Repos *repo.Manager
+	Store *eventstore.Store
+
+	// Creds resolves the credential-derived parts of each task. Nil builds a
+	// fixed provider from the Agent, LLM, Forge, Filter and Env fields below,
+	// which is what a Runner in Local mode needs and all a test wants.
+	Creds func() Creds
+
+	// Agent, LLM, Forge, Filter and Env are the fixed alternative to Creds and
+	// mean the same things; see Creds for what each one is. Set one or the
+	// other, not both: when Creds is given, these are ignored.
+	Agent  agent.Agent
+	LLM    *llm.Client
+	Forge  PRFunc
+	Filter *redact.Filter
+	Env    []string
+
+	// BudgetUSD caps what one task may spend when the task itself names no
+	// budget. Zero means uncapped.
+	BudgetUSD float64
 	// Author is who the Runner's commits are attributed to. It is a service
 	// account: a commit claiming to be the developer's would put their name on
 	// work they have not read.
 	Author repo.Author
-	// Filter masks credential values in command output. Nil masks nothing,
-	// which is correct only when there are no credentials.
-	Filter *redact.Filter
 	// Sandbox is the template for every container: image and limits. HostPath
 	// and Env are filled in per task.
 	Sandbox sandbox.Spec
-	// Env are the credentials to expose to the sandbox, as KEY=VALUE.
-	Env []string
 	// KeepWorktree leaves the checkout on disk after the task, for debugging.
 	KeepWorktree bool
 	// Run defaults to sandbox.Run.
@@ -121,6 +147,16 @@ func New(cfg Config) *Executor {
 	}
 	if cfg.Run == nil {
 		cfg.Run = sandbox.Run
+	}
+	if cfg.Creds == nil {
+		fixed := Creds{
+			Agent:  cfg.Agent,
+			LLM:    cfg.LLM,
+			Forge:  cfg.Forge,
+			Filter: cfg.Filter,
+			Env:    cfg.Env,
+		}
+		cfg.Creds = func() Creds { return fixed }
 	}
 	return &Executor{cfg: cfg, log: cfg.Logger}
 }
@@ -178,7 +214,7 @@ func (e *Executor) Run(ctx context.Context, task protocol.TaskRun, rep Reporter)
 	if budget <= 0 {
 		budget = e.cfg.BudgetUSD
 	}
-	sess := &session{ex: e, task: task, rep: rep, budget: budget}
+	sess := &session{ex: e, task: task, rep: rep, budget: budget, creds: e.cfg.Creds()}
 
 	start := time.Now()
 	err := e.execute(ctx, task, rep, sess)
@@ -215,7 +251,7 @@ func (e *Executor) execute(ctx context.Context, task protocol.TaskRun, rep Repor
 	if task.Repo == "" {
 		return errors.New("executor: task has no repo")
 	}
-	if e.cfg.Agent == nil {
+	if sess.creds.Agent == nil {
 		return errors.New("executor: no agent configured")
 	}
 
@@ -245,7 +281,7 @@ func (e *Executor) execute(ctx context.Context, task protocol.TaskRun, rep Repor
 
 	spec := e.cfg.Sandbox
 	spec.HostPath = worktree.Path
-	spec.Env = e.cfg.Env
+	spec.Env = sess.creds.Env
 	if spec.Image == "" {
 		return errors.New("executor: no sandbox image configured; set sandbox.image in the runner config")
 	}
@@ -259,7 +295,7 @@ func (e *Executor) execute(ctx context.Context, task protocol.TaskRun, rep Repor
 	e.state(ctx, task.TaskID, protocol.TaskRunning, "", rep)
 	e.emit(ctx, task.TaskID, protocol.EventStage, protocol.StagePayload{Name: "execute"}, rep)
 
-	result, err := e.cfg.Agent.Run(ctx, task, sess)
+	result, err := sess.creds.Agent.Run(ctx, task, sess)
 	if err != nil {
 		return err
 	}
@@ -295,7 +331,7 @@ func (e *Executor) publish(
 		e.log.Info("the agent changed nothing", "taskId", task.TaskID)
 		return nil
 	}
-	if e.cfg.Forge == nil {
+	if sess.creds.Forge == nil {
 		return errors.New("executor: the agent made changes but no forge is configured to open a pull request")
 	}
 
@@ -304,7 +340,7 @@ func (e *Executor) publish(
 		return err
 	}
 
-	pr, err := e.cfg.Forge(ctx, forge.Request{
+	pr, err := sess.creds.Forge(ctx, forge.Request{
 		RemoteURL: task.Repo,
 		Base:      prepared.DefaultBranch,
 		Head:      worktree.Branch,
@@ -372,6 +408,8 @@ type session struct {
 	spec    sandbox.Spec
 	workDir string
 	budget  float64
+	// creds is the credential set the task started with. See Creds.
+	creds Creds
 
 	mu     sync.Mutex
 	cmds   int
@@ -418,8 +456,8 @@ func (s *session) Exec(ctx context.Context, argv []string) (agent.Exec, error) {
 	// One buffer for both streams: the agent needs to read what happened in the
 	// order it happened, which is how a shell shows it.
 	captured := &capture{limit: maxCapture}
-	stdout := s.ex.output(ctx, s.task.TaskID, cmdID, "stdout", s.rep, captured)
-	stderr := s.ex.output(ctx, s.task.TaskID, cmdID, "stderr", s.rep, captured)
+	stdout := s.ex.output(ctx, s.task.TaskID, cmdID, "stdout", s.rep, captured, s.creds.Filter)
+	stderr := s.ex.output(ctx, s.task.TaskID, cmdID, "stderr", s.rep, captured, s.creds.Filter)
 
 	result, runErr := s.ex.cfg.Run(ctx, s.spec, argv, stdout, stderr)
 
@@ -468,7 +506,7 @@ func (s *session) ReadFile(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cannot read %s: %w", name, err)
 	}
-	return string(s.ex.cfg.Filter.Bytes(raw)), nil
+	return string(s.creds.Filter.Bytes(raw)), nil
 }
 
 // WriteFile replaces a file in the checkout.
@@ -505,7 +543,7 @@ func (s *session) path(name string) (string, error) {
 // of paying for an answer it will not use. That lets a task overshoot its
 // budget by at most one call, which is the cheaper of the two mistakes.
 func (s *session) Complete(ctx context.Context, req llm.Request) (llm.Response, error) {
-	if s.ex.cfg.LLM == nil {
+	if s.creds.LLM == nil {
 		return llm.Response{}, errors.New("executor: no llm configured; set creds.llm in the runner config")
 	}
 
@@ -516,7 +554,7 @@ func (s *session) Complete(ctx context.Context, req llm.Request) (llm.Response, 
 		return llm.Response{}, fmt.Errorf("%w: spent $%.4f of $%.4f", agent.ErrBudget, spent, s.budget)
 	}
 
-	resp, err := s.ex.cfg.LLM.Complete(ctx, req)
+	resp, err := s.creds.LLM.Complete(ctx, req)
 	if err != nil {
 		return llm.Response{}, err
 	}
@@ -553,7 +591,7 @@ func (s *session) Step(ctx context.Context, text string) {
 
 	s.ex.emit(ctx, s.task.TaskID, protocol.EventAgentStep, protocol.AgentStepPayload{
 		StepID: stepID,
-		Text:   s.ex.cfg.Filter.String(text),
+		Text:   s.creds.Filter.String(text),
 	}, s.rep)
 }
 
@@ -595,10 +633,16 @@ func (c *capture) text() (string, bool) {
 
 // output returns a writer that masks credentials and turns what survives into
 // cmd_output events, keeping a bounded copy for the agent.
-func (e *Executor) output(ctx context.Context, taskID, cmdID, stream string, rep Reporter, captured *capture) *outputWriter {
+func (e *Executor) output(
+	ctx context.Context,
+	taskID, cmdID, stream string,
+	rep Reporter,
+	captured *capture,
+	filter *redact.Filter,
+) *outputWriter {
 	sink := &chunkSink{ex: e, ctx: ctx, taskID: taskID, cmdID: cmdID, stream: stream, rep: rep}
 	// Masking happens first, so what the agent reads is what Cloud reads.
-	return &outputWriter{masked: e.cfg.Filter.Writer(io.MultiWriter(sink, captured))}
+	return &outputWriter{masked: filter.Writer(io.MultiWriter(sink, captured))}
 }
 
 type outputWriter struct {

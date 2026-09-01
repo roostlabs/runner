@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -91,49 +92,44 @@ func run() error {
 		log.Warn("no docker daemon detected; tasks will fail until one is running")
 	}
 
-	brain, model, err := newAgent(cfg)
+	creds, err := buildCreds(cfg)
 	if err != nil {
 		return err
 	}
-
-	openPR, err := newForge(cfg)
-	if err != nil {
-		return err
-	}
-	if openPR == nil {
+	if creds.Forge == nil {
 		log.Warn("no git credential configured; a task that changes anything will have nowhere to open a pull request")
 	}
 
 	repos := repo.New(filepath.Join(cfg.DataDir, "repos"), cfg.Creds.Git)
 	svc := &service{
-		ctx:   ctx,
-		cfg:   cfg,
-		store: store,
-		repos: repos,
-		log:   log,
+		ctx:        ctx,
+		configPath: *configPath,
+		store:      store,
+		repos:      repos,
+		log:        log,
 	}
+	svc.cfg.Store(&cfg)
+	svc.creds.Store(&creds)
+
 	svc.exec = executor.New(executor.Config{
-		Repos:     repos,
-		Store:     store,
-		Agent:     brain,
-		LLM:       model,
-		BudgetUSD: cfg.Agent.BudgetUSD,
-		Forge:     openPR,
-		Author:    author(cfg.Git),
-		// The filter can only mask values it was told about, which is exactly
-		// the set the sandbox is given.
-		Filter:       redact.New(cfg.Creds.Values()...),
+		Repos: repos,
+		Store: store,
+		// Resolved per task rather than captured here: Managed mode replaces
+		// credentials while the Runner is running.
+		Creds:        svc.currentCreds,
+		BudgetUSD:    cfg.Agent.BudgetUSD,
+		Author:       author(cfg.Git),
 		Sandbox:      sandboxSpec(cfg.Sandbox),
-		Env:          cfg.Creds.Env(),
 		KeepWorktree: cfg.Sandbox.KeepWorktree,
 		Run:          sandbox.Run,
 		Logger:       log,
 	})
+	svc.running = svc.exec.Active
 
 	log.Info("runner starting",
 		"version", Version, "cloud", cfg.CloudURL, "dataDir", cfg.DataDir,
 		"creds", cfg.Creds, "docker", docker, "image", cfg.Sandbox.Image,
-		"agent", agentKind(model), "model", modelName(model),
+		"agent", agentKind(creds.LLM), "model", modelName(creds.LLM),
 		"budgetUsd", cfg.Agent.BudgetUSD)
 
 	return channel.Run(ctx, channel.Options{
@@ -148,6 +144,32 @@ func run() error {
 		OnConnect: svc.onConnect,
 		Logger:    log,
 	}, svc.handle)
+}
+
+// buildCreds turns the configured credentials into what a task runs with.
+//
+// It is one function rather than five call sites so that Managed mode has
+// exactly one way to rebuild them, and so that a value the Runner cannot use —
+// a forge it does not know, a model id it cannot price — is refused while it is
+// still only a message, before anything is written to disk.
+func buildCreds(cfg config.Config) (executor.Creds, error) {
+	brain, model, err := newAgent(cfg)
+	if err != nil {
+		return executor.Creds{}, err
+	}
+	openPR, err := newForge(cfg)
+	if err != nil {
+		return executor.Creds{}, err
+	}
+	return executor.Creds{
+		Agent: brain,
+		LLM:   model,
+		Forge: openPR,
+		// The filter can only mask values it was told about, which is exactly
+		// the set the sandbox is given.
+		Filter: redact.New(cfg.Creds.Values()...),
+		Env:    cfg.Creds.Env(),
+	}, nil
 }
 
 // newAgent picks what decides a task's work.
@@ -240,16 +262,91 @@ func sandboxSpec(cfg config.Sandbox) sandbox.Spec {
 type service struct {
 	// ctx is the process lifetime, not a connection's. Tasks are started from
 	// it so that a dropped channel does not kill work in progress.
-	ctx   context.Context
-	cfg   config.Config
-	store *eventstore.Store
-	repos *repo.Manager
-	exec  *executor.Executor
-	log   *slog.Logger
+	ctx        context.Context
+	configPath string
+	store      *eventstore.Store
+	repos      *repo.Manager
+	exec       *executor.Executor
+	log        *slog.Logger
+
+	// cfg and creds are replaced together when Managed mode accepts a
+	// credential, so both are read through a pointer swap rather than copied
+	// into the components that use them.
+	cfg   atomic.Pointer[config.Config]
+	creds atomic.Pointer[executor.Creds]
+	// credMu serialises credential updates. Without it two of them could each
+	// build a new config from the same old one and the second would undo the
+	// first.
+	credMu sync.Mutex
+
+	// running reports the task holding the execution slot. It is a field rather
+	// than a call into exec so that a test can drive setCred without a Docker
+	// daemon behind it.
+	running func() (string, bool)
 
 	// conn is the current connection, replaced on every reconnect. A task that
 	// outlives a connection reports onto whatever is current when it writes.
 	conn atomic.Pointer[channel.Conn]
+}
+
+// config is the configuration as it stands now, which Managed mode can change.
+func (s *service) config() config.Config {
+	return *s.cfg.Load()
+}
+
+// currentCreds is what the Executor calls at the start of each task.
+func (s *service) currentCreds() executor.Creds {
+	return *s.creds.Load()
+}
+
+// setCred applies a credential Cloud pushed down the channel.
+//
+// Three things have to be true before a value is kept, and all three are the
+// point of the feature rather than incidental to it: the developer turned
+// Managed mode on in the config on their own machine, no task is running that
+// would see the change halfway through, and the Runner can actually build a
+// working credential set out of it. Only then is anything written, and the file
+// it is written to is the same 0600 config a Local-mode Runner reads.
+//
+// The value never appears in a log line, an error message or an event. What
+// Cloud learns back is the flag: a fresh cred.status, which the dashboard reads
+// as the slot turning from ✗ to ✓.
+func (s *service) setCred(key protocol.CredKey, value string) error {
+	s.credMu.Lock()
+	defer s.credMu.Unlock()
+
+	cfg := s.config()
+	if !cfg.Creds.Managed() {
+		return fmt.Errorf("managed mode is off; set creds.mode to %q in %s to allow it",
+			protocol.CredModeManaged, s.configPath)
+	}
+	if id, busy := s.running(); busy {
+		return fmt.Errorf("task %s is running; a credential change would land halfway through it", id)
+	}
+
+	next := cfg
+	updated, err := next.Creds.With(key, value)
+	if err != nil {
+		return err
+	}
+	next.Creds = updated
+
+	creds, err := buildCreds(next)
+	if err != nil {
+		return err
+	}
+	if err := config.Save(s.configPath, next); err != nil {
+		return err
+	}
+
+	s.cfg.Store(&next)
+	s.creds.Store(&creds)
+	s.repos.SetToken(next.Creds.Git)
+
+	// Which slot changed, and whether it now holds anything. Never the value.
+	s.log.Info("credential updated from the dashboard",
+		"key", key, "set", value != "", "creds", next.Creds)
+	return nil
 }
 
 // onConnect sends the state Cloud needs as soon as the channel is up, on every
@@ -257,7 +354,7 @@ type service struct {
 func (s *service) onConnect(ctx context.Context, c *channel.Conn) error {
 	s.conn.Store(c)
 
-	if err := c.SendMessage(ctx, protocol.TypeCredStatus, s.cfg.Creds.Status()); err != nil {
+	if err := c.SendMessage(ctx, protocol.TypeCredStatus, s.config().Creds.Status()); err != nil {
 		return err
 	}
 	if err := c.SendMessage(ctx, protocol.TypeStatus, s.status()); err != nil {
@@ -315,11 +412,30 @@ func (s *service) handle(ctx context.Context, c *channel.Conn, env protocol.Enve
 		return s.replyError(ctx, c, env.ID, protocol.ErrTaskNotFound, "no task is awaiting approval")
 
 	case protocol.TypeCredSet:
-		// Local mode is the default and this build has no Managed mode, so a
-		// credential arriving from Cloud is refused rather than written. The
-		// payload is deliberately not decoded or logged.
-		s.log.Warn("refusing cred.set: managed mode is not enabled")
-		return s.replyError(ctx, c, env.ID, protocol.ErrInternal, "managed mode is not enabled on this runner")
+		// Local mode is the default, so the message is not even decoded until
+		// the mode says it may be: a value nobody asked for should not be read
+		// out of the frame at all.
+		if !s.config().Creds.Managed() {
+			s.log.Warn("refusing cred.set: managed mode is off")
+			return s.replyError(ctx, c, env.ID, protocol.ErrCredRefused,
+				"managed mode is off on this runner; credentials are set on the VPS")
+		}
+		var cred protocol.CredSet
+		if err := env.Decode(&cred); err != nil {
+			// The error is the decoder's, so it describes the frame's shape
+			// rather than its contents.
+			return s.replyError(ctx, c, env.ID, protocol.ErrCredRefused, "malformed cred.set")
+		}
+		ref := env.ID
+		go func() {
+			if err := s.setCred(cred.Key, cred.Value); err != nil {
+				s.log.Warn("refusing cred.set", "key", cred.Key, "err", err)
+				s.sendError(ref, protocol.ErrCredRefused, err.Error())
+				return
+			}
+			s.announceCreds()
+		}()
+		return nil
 
 	case protocol.TypeQuery:
 		var q protocol.Query
@@ -433,6 +549,18 @@ func (s *service) TaskResult(ctx context.Context, taskID string, res protocol.Ta
 	return c.SendTaskMessage(ctx, protocol.TypeTaskResult, taskID, 0, res)
 }
 
+// announceCreds reports the credential flags, which is the only acknowledgement
+// a cred.set gets and the only thing Cloud is entitled to know about the values.
+func (s *service) announceCreds() {
+	c := s.conn.Load()
+	if c == nil {
+		return
+	}
+	if err := c.SendMessage(s.ctx, protocol.TypeCredStatus, s.config().Creds.Status()); err != nil {
+		s.log.Debug("could not report credential status", "err", err)
+	}
+}
+
 func (s *service) announceStatus() {
 	c := s.conn.Load()
 	if c == nil {
@@ -512,17 +640,18 @@ func (s *service) query(ctx context.Context, q protocol.Query) (any, error) {
 		return s.store.Since(ctx, p.TaskID, p.AfterSeq, p.Limit)
 
 	case protocol.QueryConfig:
-		network := s.cfg.Sandbox.Network
+		cfg := s.config()
+		network := cfg.Sandbox.Network
 		if network == "" {
 			network = sandbox.NetworkBridge
 		}
 		return configView{
-			CloudURL:      s.cfg.CloudURL,
-			DataDir:       s.cfg.DataDir,
+			CloudURL:      cfg.CloudURL,
+			DataDir:       cfg.DataDir,
 			RunnerVersion: Version,
-			Image:         s.cfg.Sandbox.Image,
+			Image:         cfg.Sandbox.Image,
 			Network:       network,
-			Creds:         s.cfg.Creds.Status(),
+			Creds:         cfg.Creds.Status(),
 		}, nil
 
 	case protocol.QueryDiskUsage:

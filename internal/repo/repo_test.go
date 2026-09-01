@@ -259,7 +259,7 @@ func TestSlugRejectsPathTraversal(t *testing.T) {
 // The token must reach git through the environment, never through argv.
 func TestConfigArgsDoNotCarryTheToken(t *testing.T) {
 	m := New(t.TempDir(), "ghp_realtokenvalue")
-	joined := strings.Join(m.configArgs(), " ")
+	joined := strings.Join(m.configArgs(m.gitToken()), " ")
 
 	if strings.Contains(joined, "ghp_realtokenvalue") {
 		t.Errorf("git config args leaked the token: %s", joined)
@@ -267,8 +267,24 @@ func TestConfigArgsDoNotCarryTheToken(t *testing.T) {
 	if !strings.Contains(joined, "ROOST_GIT_TOKEN") {
 		t.Errorf("git config args never read the token: %s", joined)
 	}
-	if strings.Contains(strings.Join(New(t.TempDir(), "").configArgs(), " "), "credential.helper") {
+	if strings.Contains(strings.Join(New(t.TempDir(), "").configArgs(""), " "), "credential.helper") {
 		t.Error("a manager with no token still configured a credential helper")
+	}
+}
+
+// Managed mode replaces the credential while the Runner is running, so a
+// revoked token has to stop being used without a restart.
+func TestSetTokenReplacesTheCredential(t *testing.T) {
+	m := New(t.TempDir(), "ghp_first")
+
+	m.SetToken("ghp_second")
+	if got := m.gitToken(); got != "ghp_second" {
+		t.Errorf("token = %q, want the replacement", got)
+	}
+
+	m.SetToken("")
+	if strings.Contains(strings.Join(m.configArgs(m.gitToken()), " "), "credential.helper") {
+		t.Error("a cleared token still configured a credential helper")
 	}
 }
 
