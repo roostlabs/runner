@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/roostlabs/protocol"
 )
 
 func validConfig() Config {
@@ -223,6 +225,10 @@ func TestValidate(t *testing.T) {
 		{"empty url", func(c *Config) { c.CloudURL = "" }, true},
 		{"empty token", func(c *Config) { c.Token = "" }, true},
 		{"empty data dir", func(c *Config) { c.DataDir = "" }, true},
+		{"local mode", func(c *Config) { c.Creds.Mode = protocol.CredModeLocal }, false},
+		{"managed mode", func(c *Config) { c.Creds.Mode = protocol.CredModeManaged }, false},
+		// A typo must not fail open in the direction that lets Cloud write.
+		{"a mode nobody recognises", func(c *Config) { c.Creds.Mode = "Managed" }, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -242,6 +248,61 @@ func TestCredsStatus(t *testing.T) {
 	}
 	if got.TaskManager {
 		t.Error("unset taskManager reported true")
+	}
+	// A config written before the mode existed is a Local one, and the status
+	// says so rather than leaving Cloud to guess.
+	if got.Mode != protocol.CredModeLocal {
+		t.Errorf("mode = %q, want %q", got.Mode, protocol.CredModeLocal)
+	}
+}
+
+// The mode has to survive the round trip, because it is the one setting that
+// decides whether Cloud may write a credential at all.
+func TestCredModeRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	want := validConfig()
+	want.Creds.Mode = protocol.CredModeManaged
+	if err := Save(path, want); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !got.Creds.Managed() {
+		t.Errorf("creds.mode = %q, want managed", got.Creds.Mode)
+	}
+	if got.Creds.Status().Mode != protocol.CredModeManaged {
+		t.Errorf("status mode = %q", got.Creds.Status().Mode)
+	}
+}
+
+func TestCredsWith(t *testing.T) {
+	c := Creds{Git: "old"}
+
+	updated, err := c.With(protocol.CredGit, "new")
+	if err != nil {
+		t.Fatalf("With: %v", err)
+	}
+	if updated.Git != "new" {
+		t.Errorf("git = %q", updated.Git)
+	}
+	if c.Git != "old" {
+		t.Error("With mutated the original")
+	}
+
+	// Clearing is how a revoked token is retired without shell access.
+	cleared, err := c.With(protocol.CredGit, "")
+	if err != nil {
+		t.Fatalf("With: %v", err)
+	}
+	if cleared.Git != "" || cleared.Status().Git {
+		t.Errorf("clearing left %+v", cleared.Status())
+	}
+
+	if _, err := c.With(protocol.CredKey("aws"), "x"); err == nil {
+		t.Error("With accepted a slot that does not exist")
 	}
 }
 

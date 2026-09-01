@@ -124,9 +124,33 @@ type Sandbox struct {
 // Creds holds the credentials a task may need. An empty field means the
 // credential is not configured, which is reported upward as a false flag.
 type Creds struct {
+	// Mode decides whether Cloud may write the fields below. Local is the
+	// default and means it may not: the values are the developer's to set on
+	// their own machine, and a `cred.set` arriving from Cloud is refused.
+	//
+	// Managed has to be turned on here rather than in the dashboard, because
+	// the whole point of it is consent: it is the developer accepting that a
+	// secret they type into a browser transits Cloud on its way down. Cloud
+	// asking itself for that permission would be no permission at all.
+	Mode protocol.CredMode `json:"mode,omitempty"`
+
 	Git         string `json:"git,omitempty"`
 	TaskManager string `json:"taskManager,omitempty"`
 	LLM         string `json:"llm,omitempty"`
+}
+
+// ModeOrDefault resolves an unset mode to Local, which is what an older config
+// with no mode field at all means.
+func (c Creds) ModeOrDefault() protocol.CredMode {
+	if c.Mode == "" {
+		return protocol.CredModeLocal
+	}
+	return c.Mode
+}
+
+// Managed reports whether Cloud may push credential values down to this Runner.
+func (c Creds) Managed() bool {
+	return c.ModeOrDefault() == protocol.CredModeManaged
 }
 
 // Status renders the credentials as the flags-only form that goes to Cloud.
@@ -135,7 +159,24 @@ func (c Creds) Status() protocol.CredStatus {
 		Git:         c.Git != "",
 		TaskManager: c.TaskManager != "",
 		LLM:         c.LLM != "",
+		Mode:        c.ModeOrDefault(),
 	}
+}
+
+// With returns a copy of the credentials with one slot replaced. An empty value
+// clears the slot, which is how a revoked token is retired.
+func (c Creds) With(key protocol.CredKey, value string) (Creds, error) {
+	switch key {
+	case protocol.CredGit:
+		c.Git = value
+	case protocol.CredTaskManager:
+		c.TaskManager = value
+	case protocol.CredLLM:
+		c.LLM = value
+	default:
+		return c, fmt.Errorf("config: unknown credential %q", key)
+	}
+	return c, nil
 }
 
 // Env renders the configured credentials as environment entries for a sandbox.
@@ -174,6 +215,7 @@ func (c Creds) Values() []string {
 func (c Creds) LogValue() slog.Value {
 	s := c.Status()
 	return slog.GroupValue(
+		slog.String("mode", string(s.Mode)),
 		slog.Bool("git", s.Git),
 		slog.Bool("taskManager", s.TaskManager),
 		slog.Bool("llm", s.LLM),
@@ -288,6 +330,14 @@ func (c Config) Validate() error {
 	}
 	if c.DataDir == "" {
 		return errors.New("config: dataDir is empty")
+	}
+	switch c.Creds.Mode {
+	case "", protocol.CredModeLocal, protocol.CredModeManaged:
+	default:
+		// A typo here would otherwise fail open in the wrong direction: a mode
+		// nobody recognises must not become "managed" by accident.
+		return fmt.Errorf("config: creds.mode %q, want %q or %q",
+			c.Creds.Mode, protocol.CredModeLocal, protocol.CredModeManaged)
 	}
 	return nil
 }
