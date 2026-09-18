@@ -273,6 +273,16 @@ func (e *Executor) execute(ctx context.Context, task protocol.TaskRun, rep Repor
 	if err := e.pickUp(ctx, &task, sess, rep); err != nil {
 		return err
 	}
+	if task.Ticket.ID != "" || task.Ticket.Title != "" {
+		// Once the text is known, not before: a polled task is one Cloud never
+		// sent, and this event is how the dashboard learns what it is for.
+		e.emit(ctx, task.TaskID, protocol.EventTicket, protocol.TicketPayload{
+			Provider: task.Ticket.Provider,
+			ID:       task.Ticket.ID,
+			URL:      task.Ticket.URL,
+			Title:    task.Ticket.Title,
+		}, rep)
+	}
 	e.emit(ctx, task.TaskID, protocol.EventStage, protocol.StagePayload{Name: "prepare-repo"}, rep)
 
 	prepared, err := e.cfg.Repos.Prepare(ctx, task.Repo, "")
