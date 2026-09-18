@@ -28,9 +28,14 @@ Working today:
   that stops the task rather than only reporting the overspend
 - the work committed to the task's branch and opened as a pull request, under a
   service account that cannot merge it
+- the ticket read from Jira or Linear when Cloud sends only its id, moved to
+  an in-progress state when the task starts, and told where its pull request
+  is when the task ends
+- tickets picked up on their own: the Runner polls the tracker for a ready
+  state and starts a task per ticket, so a ticket filed at night is a pull
+  request in the morning without anyone opening the dashboard
 
-Not there yet: metrics, human approval mid-task, and any forge other than
-GitHub.
+Not there yet: metrics and human approval mid-task.
 
 ## Install
 
@@ -102,6 +107,19 @@ The config is JSON and must be mode `0600`:
     "authorEmail": "roost@example.com",
     "forge": "gitlab",
     "apiBase": "https://git.example.com"
+  },
+  "tracker": {
+    "kind": "jira",
+    "baseUrl": "https://acme.atlassian.net",
+    "user": "roost@example.com",
+    "project": "APP",
+    "repo": "https://git.example.com/acme/app.git",
+    "pollIntervalSec": 60,
+    "states": {
+      "ready": "Ready for agent",
+      "inProgress": "In Progress",
+      "inReview": "In Review"
+    }
   }
 }
 ```
@@ -140,6 +158,32 @@ open anything on it, which is a worse failure than refusing before the push.
 `git.apiBase` overrides the API root. For GitHub Enterprise it includes the
 path — `https://git.example.com/api/v3` — and for a self-hosted GitLab it does
 not, because GitLab's own paths already start with `/api/v4`.
+
+`tracker` connects the task manager, using `creds.taskManager` as the
+credential. `tracker.kind` is `jira` or `linear`. Jira needs `baseUrl` (the
+site) and `user` (the email the API token belongs to, because Jira Cloud
+authenticates a token as `email:token`); Linear needs neither. `project` is the
+Jira project key or the Linear team key.
+
+With a tracker configured, a task whose ticket names that tracker as its
+provider is handled end to end: when Cloud sends only the ticket's id, its title
+and description are read from the tracker before anything else happens; the
+ticket is moved to `states.inProgress` when the task starts; and when a pull
+request is open, a comment with its link is left and the ticket moves to
+`states.inReview`. A task that ends without a pull request — nothing to change,
+or a failure — leaves a comment saying so. Both states are optional and named
+as you see them in the tracker, not by id. A ticket typed into the dashboard
+by hand carries the provider `manual` and is nobody's to update.
+
+`states.ready` turns polling on. Every `pollIntervalSec` (default 60) the
+Runner lists the project's tickets in that state and starts a task for the
+oldest one it has not tried recently, against `tracker.repo`. Polling needs
+`states.inProgress`: moving the ticket is what stops it being picked up again
+on the next round, so a config with `ready` and no `inProgress` is refused. A
+ticket that stays ready — the tracker refused the transition, the repository
+was unreachable — is retried after ten minutes rather than every minute. The
+VPS has no open port, so this is the Runner's own trigger: the tracker cannot
+call in, the Runner asks.
 
 `agent.budgetUsd` caps a task when Cloud sends no budget of its own. Since what
 a call will cost is not knowable before making it, the check is made on what has
@@ -203,6 +247,7 @@ work. `"network": "none"` is available today for tasks that need nothing externa
 | `internal/redact` | masks credential values in streamed output |
 | `internal/llm` | the Anthropic Messages API, and what a call cost |
 | `internal/forge` | opens the pull request the work becomes, on GitHub or GitLab |
+| `internal/tracker` | reads, moves and comments on the ticket, in Jira or Linear |
 | `internal/agent` | decides a task's work; a model, or a fixed command list |
 | `internal/executor` | runs a task, reports it throughout, and holds the budget |
 | `install.sh` | the one-liner installer: prerequisites, service account, systemd unit |

@@ -37,6 +37,7 @@ import (
 	"github.com/roostlabs/runner/internal/redact"
 	"github.com/roostlabs/runner/internal/repo"
 	"github.com/roostlabs/runner/internal/sandbox"
+	"github.com/roostlabs/runner/internal/tracker"
 )
 
 // Version is the Runner build, set with -ldflags "-X main.Version=...".
@@ -99,6 +100,9 @@ func run() error {
 	if creds.Forge == nil {
 		log.Warn("no git credential configured; a task that changes anything will have nowhere to open a pull request")
 	}
+	if creds.Tracker == nil && cfg.Creds.TaskManager != "" {
+		log.Warn("a task manager credential is configured but tracker.kind is not; tickets will not be read or updated")
+	}
 
 	repos := repo.New(filepath.Join(cfg.DataDir, "repos"), cfg.Creds.Git)
 	svc := &service{
@@ -116,8 +120,12 @@ func run() error {
 		Store: store,
 		// Resolved per task rather than captured here: Managed mode replaces
 		// credentials while the Runner is running.
-		Creds:        svc.currentCreds,
-		BudgetUSD:    cfg.Agent.BudgetUSD,
+		Creds:     svc.currentCreds,
+		BudgetUSD: cfg.Agent.BudgetUSD,
+		Tickets: executor.Tickets{
+			InProgress: cfg.Tracker.States.InProgress,
+			InReview:   cfg.Tracker.States.InReview,
+		},
 		Author:       author(cfg.Git),
 		Sandbox:      sandboxSpec(cfg.Sandbox),
 		KeepWorktree: cfg.Sandbox.KeepWorktree,
@@ -130,7 +138,15 @@ func run() error {
 		"version", Version, "cloud", cfg.CloudURL, "dataDir", cfg.DataDir,
 		"creds", cfg.Creds, "docker", docker, "image", cfg.Sandbox.Image,
 		"agent", agentKind(creds.LLM), "model", modelName(creds.LLM),
-		"budgetUsd", cfg.Agent.BudgetUSD)
+		"budgetUsd", cfg.Agent.BudgetUSD, "tracker", cfg.Tracker.Kind)
+
+	if cfg.Tracker.Polling() {
+		// Polling is the Runner's own trigger: with no port open on the VPS a
+		// tracker cannot call in, so the Runner asks. It runs from the process
+		// context, like tasks, and not from a connection: a ticket filed while
+		// Cloud is unreachable is still picked up.
+		go svc.poll(ctx)
+	}
 
 	return channel.Run(ctx, channel.Options{
 		URL:           cfg.CloudURL,
@@ -161,10 +177,15 @@ func buildCreds(cfg config.Config) (executor.Creds, error) {
 	if err != nil {
 		return executor.Creds{}, err
 	}
+	tickets, err := newTracker(cfg)
+	if err != nil {
+		return executor.Creds{}, err
+	}
 	return executor.Creds{
-		Agent: brain,
-		LLM:   model,
-		Forge: openPR,
+		Agent:   brain,
+		LLM:     model,
+		Forge:   openPR,
+		Tracker: tickets,
 		// The filter can only mask values it was told about, which is exactly
 		// the set the sandbox is given.
 		Filter: redact.New(cfg.Creds.Values()...),
@@ -212,6 +233,25 @@ func newForge(cfg config.Config) (executor.PRFunc, error) {
 		return nil, err
 	}
 	return client.Open, nil
+}
+
+// newTracker builds the task-manager connector, or reports that there is none.
+//
+// Both halves have to be present: the credential says the Runner may talk to
+// the tracker, the config says which one. A credential with no kind is not an
+// error here, because in Managed mode the credential can arrive before the
+// developer has finished the config; run warns about it instead.
+func newTracker(cfg config.Config) (tracker.Client, error) {
+	if cfg.Creds.TaskManager == "" || cfg.Tracker.Kind == "" {
+		return nil, nil
+	}
+	return tracker.New(tracker.Options{
+		Kind:    tracker.Kind(cfg.Tracker.Kind),
+		Token:   cfg.Creds.TaskManager,
+		User:    cfg.Tracker.User,
+		BaseURL: cfg.Tracker.BaseURL,
+		Project: cfg.Tracker.Project,
+	})
 }
 
 func author(cfg config.Git) repo.Author {

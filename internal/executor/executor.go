@@ -31,6 +31,7 @@ import (
 	"github.com/roostlabs/runner/internal/redact"
 	"github.com/roostlabs/runner/internal/repo"
 	"github.com/roostlabs/runner/internal/sandbox"
+	"github.com/roostlabs/runner/internal/tracker"
 )
 
 // ErrBusy means a task is already running. Concurrency is 1 by default because
@@ -83,6 +84,9 @@ type Creds struct {
 	// that changed something has nowhere to put it, which is reported as an
 	// error rather than left as a commit nobody will see.
 	Forge PRFunc
+	// Tracker reads and updates the ticket a task came from. Nil means the
+	// ticket is left alone: Cloud supplied its text, and nothing reports back.
+	Tracker tracker.Client
 	// Filter masks credential values in everything that leaves the box. Nil
 	// masks nothing, which is correct only when there are no credentials.
 	Filter *redact.Filter
@@ -100,14 +104,18 @@ type Config struct {
 	// which is what a Runner in Local mode needs and all a test wants.
 	Creds func() Creds
 
-	// Agent, LLM, Forge, Filter and Env are the fixed alternative to Creds and
-	// mean the same things; see Creds for what each one is. Set one or the
-	// other, not both: when Creds is given, these are ignored.
-	Agent  agent.Agent
-	LLM    *llm.Client
-	Forge  PRFunc
-	Filter *redact.Filter
-	Env    []string
+	// Agent, LLM, Forge, Tracker, Filter and Env are the fixed alternative to
+	// Creds and mean the same things; see Creds for what each one is. Set one
+	// or the other, not both: when Creds is given, these are ignored.
+	Agent   agent.Agent
+	LLM     *llm.Client
+	Forge   PRFunc
+	Tracker tracker.Client
+	Filter  *redact.Filter
+	Env     []string
+
+	// Tickets names the tracker states a task moves its ticket through.
+	Tickets Tickets
 
 	// BudgetUSD caps what one task may spend when the task itself names no
 	// budget. Zero means uncapped.
@@ -150,11 +158,12 @@ func New(cfg Config) *Executor {
 	}
 	if cfg.Creds == nil {
 		fixed := Creds{
-			Agent:  cfg.Agent,
-			LLM:    cfg.LLM,
-			Forge:  cfg.Forge,
-			Filter: cfg.Filter,
-			Env:    cfg.Env,
+			Agent:   cfg.Agent,
+			LLM:     cfg.LLM,
+			Forge:   cfg.Forge,
+			Tracker: cfg.Tracker,
+			Filter:  cfg.Filter,
+			Env:     cfg.Env,
 		}
 		cfg.Creds = func() Creds { return fixed }
 	}
@@ -236,6 +245,11 @@ func (e *Executor) Run(ctx context.Context, task protocol.TaskRun, rep Reporter)
 	}
 
 	cost, tokens, prURL := sess.totals()
+	if err != nil && prURL == "" {
+		// A ticket left in progress with no word of what happened is the
+		// worst outcome for the developer reading it in the morning.
+		e.leaveNote(reportCtx, sess, failureNote(task.TaskID, err))
+	}
 	if repErr := rep.TaskResult(reportCtx, task.TaskID, protocol.TaskResult{
 		PRURL:      prURL,
 		CostUSD:    cost,
@@ -256,6 +270,9 @@ func (e *Executor) execute(ctx context.Context, task protocol.TaskRun, rep Repor
 	}
 
 	e.state(ctx, task.TaskID, protocol.TaskPreparing, "", rep)
+	if err := e.pickUp(ctx, &task, sess, rep); err != nil {
+		return err
+	}
 	e.emit(ctx, task.TaskID, protocol.EventStage, protocol.StagePayload{Name: "prepare-repo"}, rep)
 
 	prepared, err := e.cfg.Repos.Prepare(ctx, task.Repo, "")
@@ -329,6 +346,7 @@ func (e *Executor) publish(
 		// nothing in it.
 		e.emit(ctx, task.TaskID, protocol.EventStage, protocol.StagePayload{Name: "no-changes"}, rep)
 		e.log.Info("the agent changed nothing", "taskId", task.TaskID)
+		e.leaveNote(ctx, sess, noChangesNote(result))
 		return nil
 	}
 	if sess.creds.Forge == nil {
@@ -358,7 +376,7 @@ func (e *Executor) publish(
 	}, rep)
 	e.log.Info("opened a pull request",
 		"taskId", task.TaskID, "url", pr.URL, "branch", worktree.Branch, "existed", pr.Existed)
-	return nil
+	return e.handOver(ctx, task, pr.URL, result, sess, rep)
 }
 
 // subjectLimit is where a commit subject stops being a subject.

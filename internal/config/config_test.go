@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/roostlabs/protocol"
 )
@@ -229,6 +230,33 @@ func TestValidate(t *testing.T) {
 		{"managed mode", func(c *Config) { c.Creds.Mode = protocol.CredModeManaged }, false},
 		// A typo must not fail open in the direction that lets Cloud write.
 		{"a mode nobody recognises", func(c *Config) { c.Creds.Mode = "Managed" }, true},
+		{"no tracker", func(c *Config) { c.Tracker = Tracker{} }, false},
+		{"jira without polling", func(c *Config) {
+			c.Tracker = Tracker{Kind: "jira", BaseURL: "https://acme.atlassian.net", User: "bot@acme.test", Project: "APP"}
+		}, false},
+		{"a tracker nobody recognises", func(c *Config) { c.Tracker.Kind = "asana" }, true},
+		{"jira over http", func(c *Config) {
+			c.Tracker = Tracker{Kind: "jira", BaseURL: "http://acme.atlassian.net"}
+		}, true},
+		{"polling with what it needs", func(c *Config) {
+			c.Tracker = Tracker{Kind: "linear", Project: "ENG", Repo: "https://github.com/acme/app.git",
+				States: TrackerStates{Ready: "Ready for agent", InProgress: "In Progress"}}
+		}, false},
+		// A ready ticket that is never moved is picked up on every poll.
+		{"polling without an in-progress state", func(c *Config) {
+			c.Tracker = Tracker{Kind: "linear", Project: "ENG", Repo: "https://github.com/acme/app.git",
+				States: TrackerStates{Ready: "Ready for agent"}}
+		}, true},
+		{"polling without a repo", func(c *Config) {
+			c.Tracker = Tracker{Kind: "linear", Project: "ENG",
+				States: TrackerStates{Ready: "Ready for agent", InProgress: "In Progress"}}
+		}, true},
+		{"a ready state with no tracker", func(c *Config) {
+			c.Tracker = Tracker{States: TrackerStates{Ready: "Ready for agent"}}
+		}, true},
+		{"a negative poll interval", func(c *Config) {
+			c.Tracker = Tracker{Kind: "linear", Project: "ENG", PollIntervalSec: -5}
+		}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -349,5 +377,20 @@ func TestDefaultPathHonoursEnv(t *testing.T) {
 	t.Setenv("ROOST_CONFIG", "/etc/roost/runner.json")
 	if got := DefaultPath(); got != "/etc/roost/runner.json" {
 		t.Errorf("DefaultPath() = %q, want the env override", got)
+	}
+}
+
+func TestTrackerPollInterval(t *testing.T) {
+	if got := (Tracker{}).PollInterval(); got != DefaultPollInterval {
+		t.Errorf("default interval = %v", got)
+	}
+	if got := (Tracker{PollIntervalSec: 15}).PollInterval(); got != 15*time.Second {
+		t.Errorf("interval = %v, want 15s", got)
+	}
+	if (Tracker{Kind: "jira"}).Polling() {
+		t.Error("a tracker with no ready state polls")
+	}
+	if !(Tracker{Kind: "jira", States: TrackerStates{Ready: "Ready"}}).Polling() {
+		t.Error("a tracker with a ready state does not poll")
 	}
 }
