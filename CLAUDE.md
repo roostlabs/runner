@@ -140,11 +140,8 @@ make lint-install
 
 ## Залежність від protocol
 
-`go.mod` вимагає тег (зараз `v0.5.0`) і має
-`replace github.com/roostlabs/protocol => ../protocol` для швидкої ітерації.
-
-`replace` прибрати **не можна, поки `roostlabs/protocol` приватний**: модуль не
-проходить через `proxy.golang.org`, тож `go build` без `replace` падає на
-`git ls-remote ... exit status 128`. Тег є і відповідає коду — але зовні
-недоступний. Коли репо стане публічним: `go mod tidy` (у `go.sum` немає запису
-для protocol, бо `replace` його не потребує), потім прибрати `replace`.
+`go.mod` вимагає тег (`v0.5.0`) і тягне модуль через `proxy.golang.org` —
+`roostlabs/protocol` публічний з 2026-09-18, `replace` більше нема. Змінив
+`protocol` — тегни там, підніми версію тут, `go mod tidy`. Для локальної
+ітерації без тегу можна тимчасово додати `replace` на `../protocol`, але **не
+комітити** його.
