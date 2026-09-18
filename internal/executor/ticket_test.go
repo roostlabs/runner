@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -126,6 +127,26 @@ func TestATrackedTicketIsReadMovedAndHandedOver(t *testing.T) {
 	}
 	if !strings.HasPrefix(stages, "fetch-ticket,ticket-in-progress,prepare-repo") {
 		t.Errorf("stages = %q, want the ticket handled before the repo is touched", stages)
+	}
+
+	// The trace names the ticket as the tracker described it, so a dashboard
+	// that never sent this task still knows what it is for.
+	var ticket protocol.TicketPayload
+	found := false
+	for _, ev := range rec.events {
+		if ev.Event == protocol.EventTicket {
+			found = true
+			if err := json.Unmarshal(ev.Payload, &ticket); err != nil {
+				t.Fatalf("decode ticket event: %v", err)
+			}
+		}
+	}
+	if !found {
+		t.Error("no ticket event was reported")
+	}
+	if ticket.ID != "APP-7" || ticket.Provider != "jira" || ticket.Title != "paginator drops the last page" ||
+		ticket.URL != "https://acme.atlassian.net/browse/APP-7" {
+		t.Errorf("ticket event = %+v", ticket)
 	}
 
 	// The commit refers to the ticket by the url the tracker gave it.
