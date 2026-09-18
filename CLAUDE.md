@@ -140,7 +140,7 @@ make lint-install
 
 ## Залежність від protocol
 
-`go.mod` вимагає тег (зараз `v0.4.0`) і має
+`go.mod` вимагає тег (зараз `v0.5.0`) і має
 `replace github.com/roostlabs/protocol => ../protocol` для швидкої ітерації.
 
 `replace` прибрати **не можна, поки `roostlabs/protocol` приватний**: модуль не

@@ -621,13 +621,6 @@ func (s *service) sendError(ref string, code protocol.ErrorCode, msg string) {
 	}
 }
 
-// traceParams is the payload of a task_trace query.
-type traceParams struct {
-	TaskID   string `json:"taskId"`
-	AfterSeq uint64 `json:"afterSeq"`
-	Limit    int    `json:"limit"`
-}
-
 // configView is the config as Cloud is allowed to see it: endpoint, paths and
 // limits, credentials as flags, and no token.
 type configView struct {
@@ -665,10 +658,23 @@ func (s *service) answerQuery(ctx context.Context, c *channel.Conn, q protocol.Q
 func (s *service) query(ctx context.Context, q protocol.Query) (any, error) {
 	switch q.What {
 	case protocol.QueryTaskHistory:
-		return s.store.Tasks(ctx)
+		var p protocol.TaskHistoryParams
+		if len(q.Params) > 0 {
+			if err := json.Unmarshal(q.Params, &p); err != nil {
+				return nil, fmt.Errorf("bad params: %w", err)
+			}
+		}
+		entries, err := s.store.History(ctx, p.Limit)
+		if err != nil {
+			return nil, err
+		}
+		if entries == nil {
+			entries = []protocol.TaskHistoryEntry{}
+		}
+		return entries, nil
 
 	case protocol.QueryTaskTrace:
-		var p traceParams
+		var p protocol.TaskTraceParams
 		if len(q.Params) > 0 {
 			if err := json.Unmarshal(q.Params, &p); err != nil {
 				return nil, fmt.Errorf("bad params: %w", err)
@@ -677,7 +683,15 @@ func (s *service) query(ctx context.Context, q protocol.Query) (any, error) {
 		if p.TaskID == "" {
 			return nil, errors.New("taskId is required")
 		}
-		return s.store.Since(ctx, p.TaskID, p.AfterSeq, p.Limit)
+		events, err := s.store.Since(ctx, p.TaskID, p.AfterSeq, p.Limit)
+		if err != nil {
+			return nil, err
+		}
+		trace := make([]protocol.TraceEvent, 0, len(events))
+		for _, ev := range events {
+			trace = append(trace, protocol.TraceEvent{Seq: ev.Seq, Event: ev.Kind, Payload: ev.Payload, TS: ev.TS})
+		}
+		return trace, nil
 
 	case protocol.QueryConfig:
 		cfg := s.config()

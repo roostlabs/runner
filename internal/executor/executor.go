@@ -245,17 +245,21 @@ func (e *Executor) Run(ctx context.Context, task protocol.TaskRun, rep Reporter)
 	}
 
 	cost, tokens, prURL := sess.totals()
+	result := protocol.TaskResult{
+		PRURL:      prURL,
+		CostUSD:    cost,
+		Tokens:     tokens,
+		DurationMs: duration.Milliseconds(),
+	}
+	if jErr := e.cfg.Store.Finish(reportCtx, task.TaskID, result, time.Now().UnixMilli()); jErr != nil {
+		e.log.Error("could not journal the result", "taskId", task.TaskID, "err", jErr)
+	}
 	if err != nil && prURL == "" {
 		// A ticket left in progress with no word of what happened is the
 		// worst outcome for the developer reading it in the morning.
 		e.leaveNote(reportCtx, sess, failureNote(task.TaskID, err))
 	}
-	if repErr := rep.TaskResult(reportCtx, task.TaskID, protocol.TaskResult{
-		PRURL:      prURL,
-		CostUSD:    cost,
-		Tokens:     tokens,
-		DurationMs: duration.Milliseconds(),
-	}); repErr != nil {
+	if repErr := rep.TaskResult(reportCtx, task.TaskID, result); repErr != nil {
 		e.log.Debug("could not report the result", "taskId", task.TaskID, "err", repErr)
 	}
 	return err
@@ -732,7 +736,16 @@ func (e *Executor) emit(ctx context.Context, taskID string, kind protocol.EventK
 }
 
 func (e *Executor) state(ctx context.Context, taskID string, status protocol.TaskStatus, reason string, rep Reporter) {
-	if err := rep.TaskState(ctx, taskID, protocol.TaskState{State: status, Reason: reason}); err != nil {
+	st := protocol.TaskState{State: status, Reason: reason}
+
+	// Journal first, as with events: a state Cloud never received is still
+	// the answer to a history query later.
+	journalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if err := e.cfg.Store.Mark(journalCtx, taskID, st, time.Now().UnixMilli()); err != nil {
+		e.log.Error("could not journal a task state", "taskId", taskID, "state", status, "err", err)
+	}
+	if err := rep.TaskState(ctx, taskID, st); err != nil {
 		e.log.Debug("could not report a state change", "taskId", taskID, "state", status, "err", err)
 	}
 }

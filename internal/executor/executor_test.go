@@ -484,3 +484,45 @@ func TestKeepWorktreeLeavesTheCheckout(t *testing.T) {
 		t.Errorf("worktree %s was removed despite KeepWorktree: %v", path, err)
 	}
 }
+
+// History is read from the journal, so the journal has to hold how a task
+// ended and not only what it did.
+func TestRunJournalsStateAndResult(t *testing.T) {
+	f := newFixture(t, Config{})
+	f.task.Ticket = protocol.Ticket{Provider: "manual", ID: "ROO-7", Title: "hand-written"}
+	if err := f.ex.Run(context.Background(), f.task, &recorder{}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	history, err := f.store.History(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if len(history) != 1 || history[0].TaskID != "T-1" {
+		t.Fatalf("history = %+v", history)
+	}
+	entry := history[0]
+	if entry.State != protocol.TaskDone {
+		t.Errorf("state = %q, want done", entry.State)
+	}
+	if entry.Result == nil {
+		t.Fatal("no result was journalled")
+	}
+	if entry.Ticket == nil || entry.Ticket.ID != "ROO-7" || entry.Ticket.Title != "hand-written" {
+		t.Errorf("ticket = %+v", entry.Ticket)
+	}
+	if entry.LastSeq == 0 {
+		t.Error("no events counted")
+	}
+
+	failing := newFixture(t, Config{Agent: agent.FixedFromArgv([][]string{{"false"}}), Run: func(context.Context, sandbox.Spec, []string, io.Writer, io.Writer) (sandbox.Result, error) {
+		return sandbox.Result{ExitCode: 1}, nil
+	}})
+	if err := failing.ex.Run(context.Background(), failing.task, &recorder{}); err == nil {
+		t.Fatal("Run succeeded with a failing step")
+	}
+	history, _ = failing.store.History(context.Background(), 0)
+	if len(history) != 1 || history[0].State != protocol.TaskFailed || history[0].Reason == "" {
+		t.Errorf("failed task's history = %+v", history)
+	}
+}
