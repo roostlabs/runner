@@ -14,6 +14,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -49,6 +50,14 @@ CREATE TABLE IF NOT EXISTS events (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
+
+CREATE TABLE IF NOT EXISTS tasks (
+	task_id    TEXT    NOT NULL PRIMARY KEY,
+	state      TEXT    NOT NULL,
+	reason     TEXT    NOT NULL DEFAULT '',
+	result     BLOB,
+	updated_at INTEGER NOT NULL
+) STRICT;
 `
 
 // Open opens the journal at path, creating the file and schema if needed.
@@ -177,25 +186,104 @@ func (s *Store) LastSeq(ctx context.Context, taskID string) (uint64, error) {
 	return seq, nil
 }
 
-// Tasks lists every task in the journal, most recently active first.
-func (s *Store) Tasks(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT task_id FROM events GROUP BY task_id ORDER BY MAX(ts) DESC`)
+// Mark records a task's lifecycle state alongside its events.
+//
+// States are not events — they are sent up as task.state, not task.event — but
+// history is read from this file, and a history that could say what a task
+// did without saying how it ended would be no history.
+func (s *Store) Mark(ctx context.Context, taskID string, st protocol.TaskState, ts int64) error {
+	if taskID == "" {
+		return errors.New("eventstore: mark: empty task id")
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO tasks (task_id, state, reason, updated_at) VALUES (?, ?, ?, ?)
+		 ON CONFLICT (task_id) DO UPDATE SET
+		   state = excluded.state, reason = excluded.reason, updated_at = excluded.updated_at`,
+		taskID, string(st.State), st.Reason, ts,
+	); err != nil {
+		return fmt.Errorf("eventstore: mark %s %s: %w", taskID, st.State, err)
+	}
+	return nil
+}
+
+// Finish records a task's result. The state stays whatever Mark last set; a
+// result arriving for a task never marked is stored against an empty state
+// rather than refused, since the result is the part worth keeping.
+func (s *Store) Finish(ctx context.Context, taskID string, res protocol.TaskResult, ts int64) error {
+	if taskID == "" {
+		return errors.New("eventstore: finish: empty task id")
+	}
+	blob, err := json.Marshal(res)
 	if err != nil {
-		return nil, fmt.Errorf("eventstore: list tasks: %w", err)
+		return fmt.Errorf("eventstore: encode result for %s: %w", taskID, err)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO tasks (task_id, state, result, updated_at) VALUES (?, '', ?, ?)
+		 ON CONFLICT (task_id) DO UPDATE SET
+		   result = excluded.result, updated_at = excluded.updated_at`,
+		taskID, blob, ts,
+	); err != nil {
+		return fmt.Errorf("eventstore: finish %s: %w", taskID, err)
+	}
+	return nil
+}
+
+// History lists every task in the journal, most recently active first, with
+// what the journal knows about each: its last state and result, the ticket
+// its trace named, and how far its events go.
+//
+// limit bounds the list; zero means all of it. Tasks are read from the events
+// table, so a task that has events but was never marked — one from before
+// states were journalled — is still listed, with no state.
+func (s *Store) History(ctx context.Context, limit int) ([]protocol.TaskHistoryEntry, error) {
+	query := `
+	SELECT e.task_id, MAX(e.seq), MIN(e.ts), MAX(MAX(e.ts), COALESCE(t.updated_at, 0)),
+	       COALESCE(t.state, ''), COALESCE(t.reason, ''), t.result,
+	       (SELECT payload FROM events WHERE task_id = e.task_id AND kind = ? ORDER BY seq LIMIT 1)
+	FROM events e LEFT JOIN tasks t ON t.task_id = e.task_id
+	GROUP BY e.task_id
+	ORDER BY 4 DESC`
+	args := []any{string(protocol.EventTicket)}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("eventstore: history: %w", err)
 	}
 	defer rows.Close()
 
-	var ids []string
+	var out []protocol.TaskHistoryEntry
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("eventstore: scan task id: %w", err)
+		var (
+			entry  protocol.TaskHistoryEntry
+			state  string
+			result []byte
+			ticket []byte
+		)
+		if err := rows.Scan(&entry.TaskID, &entry.LastSeq, &entry.StartedAt, &entry.UpdatedAt,
+			&state, &entry.Reason, &result, &ticket); err != nil {
+			return nil, fmt.Errorf("eventstore: scan history: %w", err)
 		}
-		ids = append(ids, id)
+		entry.State = protocol.TaskStatus(state)
+		if len(result) > 0 {
+			var res protocol.TaskResult
+			if err := json.Unmarshal(result, &res); err == nil {
+				entry.Result = &res
+			}
+		}
+		if len(ticket) > 0 {
+			var tk protocol.TicketPayload
+			if err := json.Unmarshal(ticket, &tk); err == nil && (tk.ID != "" || tk.Title != "") {
+				entry.Ticket = &tk
+			}
+		}
+		out = append(out, entry)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("eventstore: list tasks: %w", err)
+		return nil, fmt.Errorf("eventstore: history: %w", err)
 	}
-	return ids, nil
+	return out, nil
 }

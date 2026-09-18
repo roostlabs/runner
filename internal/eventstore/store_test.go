@@ -133,7 +133,7 @@ func TestLastSeq(t *testing.T) {
 	}
 }
 
-func TestTasksOrderedByRecency(t *testing.T) {
+func TestHistoryOrderedByRecency(t *testing.T) {
 	ctx := context.Background()
 	s := open(t)
 
@@ -144,12 +144,85 @@ func TestTasksOrderedByRecency(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	got, err := s.Tasks(ctx)
+	got, err := s.History(ctx, 0)
 	if err != nil {
-		t.Fatalf("Tasks: %v", err)
+		t.Fatalf("History: %v", err)
 	}
-	if len(got) != 2 || got[0] != "T-new" || got[1] != "T-old" {
-		t.Errorf("Tasks() = %v, want [T-new T-old]", got)
+	if len(got) != 2 || got[0].TaskID != "T-new" || got[1].TaskID != "T-old" {
+		t.Errorf("History() = %+v, want T-new then T-old", got)
+	}
+	// A task from before states were journalled is listed with none.
+	if got[0].State != "" || got[0].Result != nil {
+		t.Errorf("an unmarked task reports state %q result %v", got[0].State, got[0].Result)
+	}
+
+	limited, err := s.History(ctx, 1)
+	if err != nil {
+		t.Fatalf("History(1): %v", err)
+	}
+	if len(limited) != 1 || limited[0].TaskID != "T-new" {
+		t.Errorf("History(1) = %+v", limited)
+	}
+}
+
+func TestHistoryCarriesStateResultAndTicket(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+
+	ticket := json.RawMessage(`{"provider":"jira","id":"APP-7","title":"paginator"}`)
+	if _, err := s.Append(ctx, "T-1", protocol.EventTicket, ticket, 100); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if _, err := s.Append(ctx, "T-1", protocol.EventStage, nil, 200); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := s.Mark(ctx, "T-1", protocol.TaskState{State: protocol.TaskRunning}, 150); err != nil {
+		t.Fatalf("Mark: %v", err)
+	}
+	if err := s.Mark(ctx, "T-1", protocol.TaskState{State: protocol.TaskFailed, Reason: "tests"}, 300); err != nil {
+		t.Fatalf("Mark: %v", err)
+	}
+	if err := s.Finish(ctx, "T-1", protocol.TaskResult{CostUSD: 0.5, DurationMs: 42}, 310); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+
+	got, err := s.History(ctx, 0)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("History() = %+v", got)
+	}
+	e := got[0]
+	if e.State != protocol.TaskFailed || e.Reason != "tests" {
+		t.Errorf("state = %q %q, want the last mark", e.State, e.Reason)
+	}
+	if e.Result == nil || e.Result.CostUSD != 0.5 || e.Result.DurationMs != 42 {
+		t.Errorf("result = %+v", e.Result)
+	}
+	if e.Ticket == nil || e.Ticket.ID != "APP-7" || e.Ticket.Title != "paginator" {
+		t.Errorf("ticket = %+v", e.Ticket)
+	}
+	if e.LastSeq != 2 || e.StartedAt != 100 || e.UpdatedAt != 310 {
+		t.Errorf("seq/times = %d %d %d", e.LastSeq, e.StartedAt, e.UpdatedAt)
+	}
+}
+
+func TestFinishBeforeMarkKeepsTheResult(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	if _, err := s.Append(ctx, "T-1", protocol.EventStage, nil, 1); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := s.Finish(ctx, "T-1", protocol.TaskResult{CostUSD: 1}, 2); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if err := s.Mark(ctx, "T-1", protocol.TaskState{State: protocol.TaskDone}, 3); err != nil {
+		t.Fatalf("Mark: %v", err)
+	}
+	got, _ := s.History(ctx, 0)
+	if len(got) != 1 || got[0].Result == nil || got[0].Result.CostUSD != 1 || got[0].State != protocol.TaskDone {
+		t.Errorf("History() = %+v", got)
 	}
 }
 
