@@ -51,6 +51,11 @@ writes `/etc/roost/config.json` at mode `0600` owned by that account, and starts
 a systemd unit. `--dry-run` prints every step and changes nothing; `--help`
 lists the rest.
 
+The binary comes from the [latest release](https://github.com/roostlabs/runner/releases/latest),
+Linux amd64 or arm64, and its checksum is verified before anything is
+installed; `--version=<tag>` pins a release. `--binary=<path>` installs a
+build of your own instead.
+
 Two things it deliberately will not do. It refuses a `ws://` URL to a remote
 host, because the token would cross the network in clear text. And it never
 overwrites an existing config without `--force-config`, because that file holds
