@@ -255,6 +255,10 @@ work. `"network": "none"` is available today for tasks that need nothing externa
 
 The wire contract lives in [roostlabs/protocol](https://github.com/roostlabs/protocol).
 
+## License
+
+Apache-2.0. See `LICENSE`.
+
 ## Dependencies
 
 Two, both cgo-free, so the Runner stays a single static binary that an installer
