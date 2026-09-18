@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/roostlabs/protocol"
 )
@@ -46,6 +47,69 @@ type Config struct {
 	Agent Agent `json:"agent"`
 	// Git configures how the work is committed and published.
 	Git Git `json:"git"`
+	// Tracker connects the task manager the tickets live in.
+	Tracker Tracker `json:"tracker"`
+}
+
+// Tracker configures the task-manager connector.
+//
+// The credential is creds.taskManager; this is everything around it. The
+// connector is used when creds.taskManager is set and Kind names a tracker;
+// a task whose ticket carries that tracker's name as its provider gets its text
+// read from the tracker, its state moved, and a comment with the pull request.
+type Tracker struct {
+	// Kind is "jira" or "linear". Empty means no connector.
+	Kind string `json:"kind,omitempty"`
+	// BaseURL is the Jira site, e.g. https://acme.atlassian.net. Required for
+	// Jira; for Linear it overrides the API endpoint and is normally unset.
+	BaseURL string `json:"baseUrl,omitempty"`
+	// User is the account the Jira token belongs to, as its email. Jira Cloud
+	// authenticates an API token as email:token. Linear ignores it.
+	User string `json:"user,omitempty"`
+	// Project is the Jira project key or the Linear team key: where polling
+	// looks for tickets.
+	Project string `json:"project,omitempty"`
+	// Repo is the repository polled tickets are worked on, as the git remote
+	// url a task names. One tracker, one repository, for now.
+	Repo string `json:"repo,omitempty"`
+	// PollIntervalSec is how often the tracker is asked for tickets in the
+	// ready state. Zero uses the default; polling itself is turned on by
+	// states.ready.
+	PollIntervalSec int `json:"pollIntervalSec,omitempty"`
+	// States names the workflow states a ticket moves through.
+	States TrackerStates `json:"states"`
+}
+
+// TrackerStates are named as the developer sees them in the tracker, not by
+// id; the connector resolves them.
+type TrackerStates struct {
+	// Ready is the state that means "an agent may take this". Set, it turns
+	// polling on: every ticket the project has in this state becomes a task.
+	Ready string `json:"ready,omitempty"`
+	// InProgress is where a ticket goes when its task starts. Required when
+	// polling, because it is what stops the same ticket being picked twice.
+	InProgress string `json:"inProgress,omitempty"`
+	// InReview is where a ticket goes once its pull request is open. Empty
+	// leaves it where it is, with the comment.
+	InReview string `json:"inReview,omitempty"`
+}
+
+// DefaultPollInterval is how often polling asks the tracker when the config
+// does not say. A minute is slow enough to be no load on anyone's API and
+// fast enough that a ticket filed at night is picked up at night.
+const DefaultPollInterval = time.Minute
+
+// Polling reports whether this Runner picks tickets up on its own.
+func (t Tracker) Polling() bool {
+	return t.Kind != "" && t.States.Ready != ""
+}
+
+// PollInterval is the configured interval, or the default.
+func (t Tracker) PollInterval() time.Duration {
+	if t.PollIntervalSec > 0 {
+		return time.Duration(t.PollIntervalSec) * time.Second
+	}
+	return DefaultPollInterval
 }
 
 // Git configures the commit and the pull request a finished task becomes.
@@ -338,6 +402,39 @@ func (c Config) Validate() error {
 		// nobody recognises must not become "managed" by accident.
 		return fmt.Errorf("config: creds.mode %q, want %q or %q",
 			c.Creds.Mode, protocol.CredModeLocal, protocol.CredModeManaged)
+	}
+	return c.Tracker.validate()
+}
+
+// validate checks what can be checked without the credential: which tracker,
+// and that polling has what it needs to not run the same ticket forever.
+func (t Tracker) validate() error {
+	switch t.Kind {
+	case "", "jira", "linear":
+	default:
+		return fmt.Errorf("config: tracker.kind %q, want %q or %q", t.Kind, "jira", "linear")
+	}
+	if t.Kind == "jira" && t.BaseURL != "" {
+		u, err := url.Parse(t.BaseURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("config: tracker.baseUrl %q, want an https url such as https://acme.atlassian.net", t.BaseURL)
+		}
+	}
+	if t.PollIntervalSec < 0 {
+		return fmt.Errorf("config: tracker.pollIntervalSec %d is negative", t.PollIntervalSec)
+	}
+	if t.Polling() {
+		if t.Repo == "" {
+			return errors.New("config: tracker.states.ready turns polling on, which needs tracker.repo to know what to work on")
+		}
+		if t.States.InProgress == "" {
+			// Without a state to move to, a picked-up ticket is still ready
+			// on the next poll, and the Runner would run it again and again.
+			return errors.New("config: tracker.states.ready turns polling on, which needs tracker.states.inProgress so a ticket is not picked up twice")
+		}
+	}
+	if t.States.Ready != "" && t.Kind == "" {
+		return errors.New("config: tracker.states.ready is set but tracker.kind is not")
 	}
 	return nil
 }
