@@ -26,6 +26,8 @@ Working today:
   commands, through a session that cannot reach past the task's checkout
 - every model call priced and journalled as an `llm_call` event, and a budget
   that stops the task rather than only reporting the overspend
+- an agent that repeats the same call and gets the same answer is warned once,
+  then stopped, before the step limit or the budget would have caught it
 - the work committed to the task's branch and opened as a pull request, under a
   service account that cannot merge it
 - the ticket read from Jira or Linear when Cloud sends only its id, moved to
@@ -198,6 +200,13 @@ call in, the Runner asks.
 a call will cost is not knowable before making it, the check is made on what has
 already been spent, so a task can overshoot by one call and no more. Zero leaves
 it uncapped, which is worth deciding deliberately.
+
+`agent.maxSteps` (default 40) bounds the conversation. Before that limit is
+reached, a loop that repeats itself is caught earlier: a tool call that comes
+back with the same result it already produced earns the model a warning in the
+result, and the third identical pass fails the task as looping. The same
+command with a different output counts as progress; `write_file` is never
+counted, since rewriting a file is how a model retries.
 
 `ROOST_CONFIG` overrides the config path, `ROOST_DATA_DIR` the data directory.
 

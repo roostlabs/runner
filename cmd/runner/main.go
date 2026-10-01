@@ -559,6 +559,10 @@ func (s *service) startTask(task protocol.TaskRun, ref string) {
 			// differently from a task that broke.
 			s.log.Warn("task stopped on budget", "taskId", task.TaskID, "err", err)
 			s.sendError(ref, protocol.ErrBudgetExceeded, err.Error())
+		case errors.Is(err, agent.ErrLoop):
+			// Not a crash: the agent was stopped on purpose, which the log
+			// should say before anyone goes looking for a bug.
+			s.log.Warn("task stopped: agent was looping", "taskId", task.TaskID, "err", err)
 		default:
 			s.log.Warn("task failed", "taskId", task.TaskID, "err", err)
 		}

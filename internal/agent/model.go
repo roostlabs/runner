@@ -44,6 +44,7 @@ func (m Model) Run(ctx context.Context, task protocol.TaskRun, s Session) (Resul
 
 	messages := []llm.Message{llm.UserText(taskPrompt(task))}
 	nudges := 0
+	var guard loopGuard
 
 	for step := 0; step < maxSteps; step++ {
 		if err := ctx.Err(); err != nil {
@@ -110,6 +111,13 @@ func (m Model) Run(ctx context.Context, task protocol.TaskRun, s Session) (Resul
 				continue
 			}
 			out, isErr := m.runTool(ctx, s, use)
+			switch repeats := guard.observe(use.Name, use.Input, out); {
+			case repeats >= loopStopAt:
+				return Result{}, fmt.Errorf("%w: %s repeated %d times with the same result", ErrLoop, use.Name, repeats)
+			case repeats >= loopWarnAt:
+				s.Step(ctx, "warned the model: "+use.Name+" repeated with the same result")
+				out += loopWarning
+			}
 			results = append(results, llm.ToolResult(use.ID, out, isErr))
 		}
 
