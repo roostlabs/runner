@@ -289,6 +289,13 @@ func TestRunReadOnlyRootBlocksWrites(t *testing.T) {
 		HostPath:     t.TempDir(),
 		Network:      NetworkNone,
 		ReadOnlyRoot: true,
+		// As in production: the Runner's own uid, so the working copy it
+		// owns is writable. Root would not do — with every capability
+		// dropped, root has no CAP_DAC_OVERRIDE and cannot write to a 0700
+		// directory owned by somebody else, which is what t.TempDir() is
+		// on a Linux host. Docker Desktop on macOS hides that by mapping
+		// ownership, which is why this only showed up in CI.
+		User: CurrentUser(),
 	}
 
 	// Outside the working copy and /tmp, nothing should be writable.
