@@ -247,6 +247,22 @@ func TestValidate(t *testing.T) {
 			c.Tracker = Tracker{Kind: "jira", BaseURL: "https://acme.atlassian.net", User: "bot@acme.test", Project: "APP"}
 		}, false},
 		{"a tracker nobody recognises", func(c *Config) { c.Tracker.Kind = "asana" }, true},
+		{"polling several projects", func(c *Config) {
+			c.Tracker = Tracker{Kind: "jira", BaseURL: "https://acme.atlassian.net",
+				Projects: map[string]string{"APP": "https://github.com/acme/app.git", "WEB": "https://github.com/acme/web.git"},
+				States:   TrackerStates{Ready: "Ready for agent", InProgress: "In Progress"}}
+		}, false},
+		{"a project with no repository", func(c *Config) {
+			c.Tracker = Tracker{Kind: "jira", BaseURL: "https://acme.atlassian.net",
+				Projects: map[string]string{"APP": ""},
+				States:   TrackerStates{Ready: "Ready for agent", InProgress: "In Progress"}}
+		}, true},
+		{"an empty project key", func(c *Config) {
+			c.Tracker = Tracker{Kind: "linear", Projects: map[string]string{" ": "https://github.com/acme/app.git"}}
+		}, true},
+		{"repo without a project", func(c *Config) {
+			c.Tracker = Tracker{Kind: "linear", Repo: "https://github.com/acme/app.git"}
+		}, true},
 		{"jira over http", func(c *Config) {
 			c.Tracker = Tracker{Kind: "jira", BaseURL: "http://acme.atlassian.net"}
 		}, true},
@@ -389,6 +405,23 @@ func TestDefaultPathHonoursEnv(t *testing.T) {
 	t.Setenv("ROOST_CONFIG", "/etc/roost/runner.json")
 	if got := DefaultPath(); got != "/etc/roost/runner.json" {
 		t.Errorf("DefaultPath() = %q, want the env override", got)
+	}
+}
+
+func TestTrackerReposMergesShorthandAndMap(t *testing.T) {
+	tr := Tracker{
+		Project: "ENG", Repo: "https://github.com/acme/app.git",
+		Projects: map[string]string{"WEB": "https://github.com/acme/web.git"},
+	}
+	repos := tr.Repos()
+	if len(repos) != 2 || repos["ENG"] != "https://github.com/acme/app.git" || repos["WEB"] != "https://github.com/acme/web.git" {
+		t.Errorf("repos = %v", repos)
+	}
+	if keys := tr.ProjectKeys(); len(keys) != 2 || keys[0] != "ENG" || keys[1] != "WEB" {
+		t.Errorf("keys = %v, want sorted", keys)
+	}
+	if len((Tracker{}).Repos()) != 0 {
+		t.Error("an empty tracker has repos")
 	}
 }
 

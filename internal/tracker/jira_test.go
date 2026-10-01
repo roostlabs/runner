@@ -132,7 +132,7 @@ func TestJiraList(t *testing.T) {
 		w.Write([]byte(`{"issues":[` + jiraIssueJSON + `,{"key":"APP-9","fields":{"summary":"second","status":{"name":"Ready for agent"}}}]}`))
 	})
 
-	tickets, err := c.List(context.Background(), `Ready "for" agent`)
+	tickets, err := c.List(context.Background(), "", `Ready "for" agent`)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -242,5 +242,19 @@ func TestNewRefusesBadOptions(t *testing.T) {
 		if _, err := New(o); err == nil {
 			t.Errorf("%s: New accepted %+v", name, o)
 		}
+	}
+}
+
+func TestJiraListTakesAnotherProject(t *testing.T) {
+	var gotBody map[string]any
+	c := jiraClient(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Write([]byte(`{"issues":[]}`))
+	})
+	if _, err := c.List(context.Background(), "WEB", "Ready"); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if jql, _ := gotBody["jql"].(string); !strings.HasPrefix(jql, `project = "WEB"`) {
+		t.Errorf("jql = %q, want the project asked for", jql)
 	}
 }

@@ -89,7 +89,14 @@ func (l *linear) issue(ctx context.Context, id string) (linearIssue, error) {
 	return *data.Issue, nil
 }
 
-func (l *linear) List(ctx context.Context, state string) ([]Ticket, error) {
+func (l *linear) List(ctx context.Context, project, state string) ([]Ticket, error) {
+	team := project
+	if team == "" {
+		team = l.team
+	}
+	if team == "" {
+		return nil, errors.New("tracker: no team to list")
+	}
 	if state == "" {
 		return nil, errors.New("tracker: no state to list")
 	}
@@ -106,7 +113,7 @@ func (l *linear) List(ctx context.Context, state string) ([]Ticket, error) {
 		    first: $first
 		  ) { nodes { `+issueFields+` } }
 		}`,
-		map[string]any{"team": l.team, "state": strings.TrimSpace(state), "first": listLimit}, &data)
+		map[string]any{"team": team, "state": strings.TrimSpace(state), "first": listLimit}, &data)
 	if err != nil {
 		return nil, err
 	}

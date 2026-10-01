@@ -38,7 +38,7 @@ func (f *fakeTracker) Get(_ context.Context, id string) (tracker.Ticket, error) 
 	return f.ticket, f.getErr
 }
 
-func (f *fakeTracker) List(context.Context, string) ([]tracker.Ticket, error) {
+func (f *fakeTracker) List(context.Context, string, string) ([]tracker.Ticket, error) {
 	return nil, errors.New("not used by the executor")
 }
 

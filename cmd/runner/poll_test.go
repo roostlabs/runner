@@ -20,13 +20,20 @@ import (
 // poller asks.
 type listOnly struct {
 	tickets []tracker.Ticket
-	err     error
-	calls   int
+	// byProject answers per project when set; tickets is the fallback.
+	byProject map[string][]tracker.Ticket
+	err       error
+	calls     int
+	projects  []string
 }
 
 func (l *listOnly) Kind() tracker.Kind { return tracker.KindLinear }
-func (l *listOnly) List(context.Context, string) ([]tracker.Ticket, error) {
+func (l *listOnly) List(_ context.Context, project, _ string) ([]tracker.Ticket, error) {
 	l.calls++
+	l.projects = append(l.projects, project)
+	if l.byProject != nil {
+		return l.byProject[project], l.err
+	}
 	return l.tickets, l.err
 }
 func (l *listOnly) Get(context.Context, string) (tracker.Ticket, error) {
@@ -176,5 +183,66 @@ func TestSettingTheTaskManagerKeyTurnsOnTheTracker(t *testing.T) {
 	}
 	if svc.currentCreds().Tracker != nil {
 		t.Error("the connector outlived its credential")
+	}
+}
+
+func TestPickAsksEveryProjectAndRoutesToItsRepo(t *testing.T) {
+	tr := &listOnly{byProject: map[string][]tracker.Ticket{
+		"ENG": nil,
+		"WEB": ready("WEB-4"),
+	}}
+	svc, _ := pollingService(t, tr)
+	cfg := svc.config()
+	cfg.Tracker.Project, cfg.Tracker.Repo = "", ""
+	cfg.Tracker.Projects = map[string]string{
+		"WEB": "https://github.com/acme/web.git",
+		"ENG": "https://github.com/acme/app.git",
+	}
+	svc.cfg.Store(&cfg)
+
+	task, ok := svc.pick(context.Background(), map[string]time.Time{})
+	if !ok || task.Ticket.ID != "WEB-4" {
+		t.Fatalf("picked %+v", task)
+	}
+	if task.Repo != "https://github.com/acme/web.git" {
+		t.Errorf("repo = %q, want WEB's repository", task.Repo)
+	}
+	// Projects are asked in a fixed order, ENG before WEB, so a log and a
+	// test read the same thing twice.
+	if len(tr.projects) != 2 || tr.projects[0] != "ENG" || tr.projects[1] != "WEB" {
+		t.Errorf("asked %v, want [ENG WEB]", tr.projects)
+	}
+}
+
+func TestPickKeepsTheShorthandProjectAlongsideTheMap(t *testing.T) {
+	tr := &listOnly{byProject: map[string][]tracker.Ticket{"ENG": ready("ENG-1")}}
+	svc, _ := pollingService(t, tr)
+	cfg := svc.config()
+	cfg.Tracker.Projects = map[string]string{"WEB": "https://github.com/acme/web.git"}
+	svc.cfg.Store(&cfg)
+
+	task, ok := svc.pick(context.Background(), map[string]time.Time{})
+	if !ok || task.Ticket.ID != "ENG-1" || task.Repo != "https://github.com/acme/app.git" {
+		t.Errorf("picked %+v, want ENG-1 against the shorthand repo", task)
+	}
+}
+
+func TestPickSurvivesOneProjectFailing(t *testing.T) {
+	// The fake fails every call; with two projects both fail and nothing is
+	// picked, but the second is still asked rather than skipped.
+	tr := &listOnly{err: errors.New("jira is having a day")}
+	svc, logs := pollingService(t, tr)
+	cfg := svc.config()
+	cfg.Tracker.Projects = map[string]string{"WEB": "https://github.com/acme/web.git"}
+	svc.cfg.Store(&cfg)
+
+	if _, ok := svc.pick(context.Background(), map[string]time.Time{}); ok {
+		t.Error("picked a ticket from a failing tracker")
+	}
+	if tr.calls != 2 {
+		t.Errorf("asked %d projects, want both", tr.calls)
+	}
+	if !bytes.Contains(logs.Bytes(), []byte("project=WEB")) {
+		t.Errorf("the warning does not name the project:\n%s", logs.String())
 	}
 }

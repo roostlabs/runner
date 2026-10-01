@@ -159,8 +159,10 @@ The config is JSON and must be mode `0600`:
     "kind": "jira",
     "baseUrl": "https://acme.atlassian.net",
     "user": "roost@example.com",
-    "project": "APP",
-    "repo": "https://git.example.com/acme/app.git",
+    "projects": {
+      "APP": "https://git.example.com/acme/app.git",
+      "WEB": "https://git.example.com/acme/web.git"
+    },
     "pollIntervalSec": 60,
     "states": {
       "ready": "Ready for agent",
@@ -228,8 +230,13 @@ as you see them in the tracker, not by id. A ticket typed into the dashboard
 by hand carries the provider `manual` and is nobody's to update.
 
 `states.ready` turns polling on. Every `pollIntervalSec` (default 60) the
-Runner lists the project's tickets in that state and starts a task for the
-oldest one it has not tried recently, against `tracker.repo`. Polling needs
+Runner lists each project's tickets in that state and starts a task for the
+first one it has not tried recently, against that project's repository.
+`tracker.projects` maps a Jira project key or Linear team key to a git remote
+url; `tracker.project` with `tracker.repo` is the one-project shorthand and
+counts as one more entry. One tracker, one token, several repositories on the
+same VPS, still one task at a time. A project the tracker cannot list is
+skipped for that round and the others are still asked. Polling needs
 `states.inProgress`: moving the ticket is what stops it being picked up again
 on the next round, so a config with `ready` and no `inProgress` is refused. A
 ticket that stays ready — the tracker refused the transition, the repository

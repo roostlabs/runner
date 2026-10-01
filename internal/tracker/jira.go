@@ -87,13 +87,19 @@ func (j *jira) Get(ctx context.Context, id string) (Ticket, error) {
 
 // List searches with JQL. The state is quoted for JQL, since "Ready for agent"
 // is a perfectly good state name and would otherwise be three tokens.
-func (j *jira) List(ctx context.Context, state string) ([]Ticket, error) {
+func (j *jira) List(ctx context.Context, project, state string) ([]Ticket, error) {
 	if state == "" {
 		return nil, errors.New("tracker: no state to list")
 	}
+	if project == "" {
+		project = j.project
+	}
+	if project == "" {
+		return nil, errors.New("tracker: no project to list")
+	}
 	body, err := json.Marshal(map[string]any{
 		"jql": fmt.Sprintf("project = %s AND status = %s ORDER BY created ASC",
-			jqlString(j.project), jqlString(state)),
+			jqlString(project), jqlString(state)),
 		"fields":     []string{"summary", "description", "status"},
 		"maxResults": listLimit,
 	})

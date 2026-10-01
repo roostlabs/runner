@@ -16,6 +16,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/roostlabs/protocol"
@@ -152,11 +154,16 @@ type Tracker struct {
 	// authenticates an API token as email:token. Linear ignores it.
 	User string `json:"user,omitempty"`
 	// Project is the Jira project key or the Linear team key: where polling
-	// looks for tickets.
+	// looks for tickets. With Repo it is the one-project shorthand for
+	// Projects.
 	Project string `json:"project,omitempty"`
-	// Repo is the repository polled tickets are worked on, as the git remote
-	// url a task names. One tracker, one repository, for now.
+	// Repo is the repository Project's tickets are worked on, as the git
+	// remote url a task names.
 	Repo string `json:"repo,omitempty"`
+	// Projects maps a Jira project key or Linear team key to the repository
+	// its tickets are worked on. One tracker, one token, several projects;
+	// polling asks for each. Project and Repo, when set, are one more entry.
+	Projects map[string]string `json:"projects,omitempty"`
 	// PollIntervalSec is how often the tracker is asked for tickets in the
 	// ready state. Zero uses the default; polling itself is turned on by
 	// states.ready.
@@ -185,6 +192,31 @@ type TrackerStates struct {
 const DefaultPollInterval = time.Minute
 
 // Polling reports whether this Runner picks tickets up on its own.
+// Repos is every project polling looks at, with the repository each one's
+// tickets are worked on: Projects plus the Project/Repo shorthand.
+func (t Tracker) Repos() map[string]string {
+	out := make(map[string]string, len(t.Projects)+1)
+	for project, repo := range t.Projects {
+		out[project] = repo
+	}
+	if t.Project != "" && t.Repo != "" {
+		out[t.Project] = t.Repo
+	}
+	return out
+}
+
+// ProjectKeys is Repos' keys in a fixed order, so polling and logs are
+// deterministic.
+func (t Tracker) ProjectKeys() []string {
+	repos := t.Repos()
+	keys := make([]string, 0, len(repos))
+	for k := range repos {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func (t Tracker) Polling() bool {
 	return t.Kind != "" && t.States.Ready != ""
 }
@@ -525,9 +557,20 @@ func (t Tracker) validate() error {
 	if t.PollIntervalSec < 0 {
 		return fmt.Errorf("config: tracker.pollIntervalSec %d is negative", t.PollIntervalSec)
 	}
+	if t.Repo != "" && t.Project == "" {
+		return errors.New("config: tracker.repo is set but tracker.project is not; which project's tickets go there?")
+	}
+	for project, repo := range t.Projects {
+		if strings.TrimSpace(project) == "" {
+			return errors.New("config: tracker.projects has an empty project key")
+		}
+		if repo == "" {
+			return fmt.Errorf("config: tracker.projects.%s has no repository", project)
+		}
+	}
 	if t.Polling() {
-		if t.Repo == "" {
-			return errors.New("config: tracker.states.ready turns polling on, which needs tracker.repo to know what to work on")
+		if len(t.Repos()) == 0 {
+			return errors.New("config: tracker.states.ready turns polling on, which needs tracker.projects (or tracker.project and tracker.repo) to know what to work on")
 		}
 		if t.States.InProgress == "" {
 			// Without a state to move to, a picked-up ticket is still ready

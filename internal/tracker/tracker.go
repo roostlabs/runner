@@ -69,8 +69,10 @@ type Client interface {
 	Kind() Kind
 	// Get reads one ticket by its key.
 	Get(ctx context.Context, id string) (Ticket, error)
-	// List returns the project's tickets in the named state, oldest first.
-	List(ctx context.Context, state string) ([]Ticket, error)
+	// List returns a project's tickets in the named state, oldest first.
+	// project is a Jira project key or a Linear team key; empty means the
+	// one the client was built with.
+	List(ctx context.Context, project, state string) ([]Ticket, error)
 	// Transition moves a ticket into the named state.
 	Transition(ctx context.Context, id, state string) error
 	// Comment adds a comment. Body is plain text; paragraphs are separated by

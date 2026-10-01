@@ -30,8 +30,8 @@ func (s *service) poll(ctx context.Context) {
 	cfg := s.config().Tracker
 	interval := cfg.PollInterval()
 	s.log.Info("polling the tracker for ready tickets",
-		"tracker", cfg.Kind, "project", cfg.Project, "state", cfg.States.Ready,
-		"repo", cfg.Repo, "every", interval)
+		"tracker", cfg.Kind, "projects", cfg.ProjectKeys(), "state", cfg.States.Ready,
+		"every", interval)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -51,9 +51,11 @@ func (s *service) poll(ctx context.Context) {
 	}
 }
 
-// pick is one round: the task to start, if there is one. tried remembers which
-// tickets were started and when, so a ticket that stays ready is retried on a
-// schedule rather than every round.
+// pick is one round: the task to start, if there is one. Every project is
+// asked, in a fixed order, and the first untried ticket wins; the rest are
+// still there on the next round. tried remembers which tickets were started
+// and when, so a ticket that stays ready is retried on a schedule rather than
+// every round.
 func (s *service) pick(ctx context.Context, tried map[string]time.Time) (protocol.TaskRun, bool) {
 	if id, busy := s.running(); busy {
 		s.log.Debug("not polling: a task is running", "taskId", id)
@@ -69,14 +71,6 @@ func (s *service) pick(ctx context.Context, tried map[string]time.Time) (protoco
 		return protocol.TaskRun{}, false
 	}
 
-	listCtx, cancel := context.WithTimeout(ctx, pollTimeout)
-	tickets, err := t.List(listCtx, cfg.States.Ready)
-	cancel()
-	if err != nil {
-		s.log.Warn("could not list ready tickets", "tracker", t.Kind(), "err", err)
-		return protocol.TaskRun{}, false
-	}
-
 	now := time.Now()
 	for id, at := range tried {
 		if now.Sub(at) >= retryAfter {
@@ -84,23 +78,35 @@ func (s *service) pick(ctx context.Context, tried map[string]time.Time) (protoco
 		}
 	}
 
-	for _, ticket := range tickets {
-		if _, recent := tried[ticket.ID]; recent {
+	repos := cfg.Repos()
+	for _, project := range cfg.ProjectKeys() {
+		listCtx, cancel := context.WithTimeout(ctx, pollTimeout)
+		tickets, err := t.List(listCtx, project, cfg.States.Ready)
+		cancel()
+		if err != nil {
+			// One project's failure is not another's: the rest are still
+			// asked, and this one is asked again next round.
+			s.log.Warn("could not list ready tickets", "tracker", t.Kind(), "project", project, "err", err)
 			continue
 		}
-		tried[ticket.ID] = now
+		for _, ticket := range tickets {
+			if _, recent := tried[ticket.ID]; recent {
+				continue
+			}
+			tried[ticket.ID] = now
 
-		return protocol.TaskRun{
-			TaskID: "t-" + newTaskID(),
-			Repo:   cfg.Repo,
-			Ticket: protocol.Ticket{
-				Provider: string(t.Kind()),
-				ID:       ticket.ID,
-				URL:      ticket.URL,
-				Title:    ticket.Title,
-				Body:     ticket.Body,
-			},
-		}, true
+			return protocol.TaskRun{
+				TaskID: "t-" + newTaskID(),
+				Repo:   repos[project],
+				Ticket: protocol.Ticket{
+					Provider: string(t.Kind()),
+					ID:       ticket.ID,
+					URL:      ticket.URL,
+					Title:    ticket.Title,
+					Body:     ticket.Body,
+				},
+			}, true
+		}
 	}
 	return protocol.TaskRun{}, false
 }

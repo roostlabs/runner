@@ -100,7 +100,7 @@ func TestLinearList(t *testing.T) {
 	c, g := linearClient(t, map[string]string{
 		"issues": `{"data":{"issues":{"nodes":[` + linearIssueJSON + `]}}}`,
 	})
-	tickets, err := c.List(context.Background(), " Ready for agent ")
+	tickets, err := c.List(context.Background(), "", " Ready for agent ")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -188,5 +188,17 @@ func TestLinearHTTPError(t *testing.T) {
 	_, err = c.Get(context.Background(), "ENG-7")
 	if err == nil || !strings.Contains(err.Error(), "http 401") || !strings.Contains(err.Error(), "not authenticated") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+func TestLinearListTakesAnotherTeam(t *testing.T) {
+	c, g := linearClient(t, map[string]string{
+		"issues": `{"data":{"issues":{"nodes":[]}}}`,
+	})
+	if _, err := c.List(context.Background(), "WEB", "Ready for agent"); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if vars := g.vars(0); vars["team"] != "WEB" {
+		t.Errorf("team = %v, want the one asked for over the configured one", vars["team"])
 	}
 }
