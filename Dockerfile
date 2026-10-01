@@ -26,6 +26,11 @@ RUN apk add --no-cache ca-certificates git docker-cli \
  && chown roost:roost /etc/roost
 COPY --from=build /out/roost-runner /usr/local/bin/roost-runner
 
+# Ties the image on ghcr.io to this repository, so the package shows up on the
+# repository page and inherits its visibility settings.
+LABEL org.opencontainers.image.source="https://github.com/roostlabs/runner" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 # The same paths the installer uses, so one config works in both.
 ENV ROOST_CONFIG=/etc/roost/config.json \
     ROOST_DATA_DIR=/var/lib/roost
