@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	github.com/coder/websocket v1.8.15
-	github.com/roostlabs/protocol v0.6.0
+	github.com/roostlabs/protocol v0.6.1
 	modernc.org/sqlite v1.56.0
 )
 
