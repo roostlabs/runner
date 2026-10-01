@@ -288,6 +288,11 @@ cross-compiled binary, and `docker` and `systemctl` stubbed out, asserting the
 file modes, the ownership, the unit's contents, and that a second run leaves an
 existing config alone. Those tests are skipped when no Docker daemon answers.
 
+The same checks run in GitHub Actions on every push and pull request
+(`.github/workflows/ci.yml`), and a pushed tag `v*` builds the release tarballs
+and publishes them with their checksums (`.github/workflows/release.yml`), so a
+release is a tag and nothing more.
+
 The channel tests run against a stub Cloud and the repo tests against a local
 git repository, so neither needs a network. The sandbox tests that need a real
 container are skipped when no Docker daemon answers; the rest of the suite still
