@@ -130,6 +130,9 @@ func failureNote(taskID string, err error) string {
 		return fmt.Sprintf("Task %s was cancelled before it opened a pull request.", taskID)
 	case errors.Is(err, agent.ErrBudget):
 		return fmt.Sprintf("Task %s stopped: it reached its budget before it opened a pull request.", taskID)
+	case errors.Is(err, ErrDeclined):
+		return fmt.Sprintf("Task %s finished, but its pull request was declined and not opened. "+
+			"The change is on the task's branch on the server.", taskID)
 	default:
 		return fmt.Sprintf("Task %s failed before it opened a pull request: %v", taskID, err)
 	}

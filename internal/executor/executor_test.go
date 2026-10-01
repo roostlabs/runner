@@ -82,6 +82,12 @@ func (r *recorder) statuses() []protocol.TaskStatus {
 	return out
 }
 
+func (r *recorder) taskStates() []protocol.TaskState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]protocol.TaskState(nil), r.states...)
+}
+
 func (r *recorder) output() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()

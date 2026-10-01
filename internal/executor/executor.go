@@ -127,6 +127,13 @@ type Config struct {
 	// Sandbox is the template for every container: image and limits. HostPath
 	// and Env are filled in per task.
 	Sandbox sandbox.Spec
+	// ApprovePR parks every task that produced a change until the developer
+	// approves the pull request, via Approve. The commit is made first, so
+	// what is approved is exactly what is pushed.
+	ApprovePR bool
+	// ApprovalTimeout is how long such a task waits. Zero uses
+	// DefaultApprovalTimeout.
+	ApprovalTimeout time.Duration
 	// KeepWorktree leaves the checkout on disk after the task, for debugging.
 	KeepWorktree bool
 	// Run defaults to sandbox.Run.
@@ -146,6 +153,8 @@ type Executor struct {
 type active struct {
 	id     string
 	cancel context.CancelFunc
+	// pending is the question the task is waiting on, if any.
+	pending *approval
 }
 
 // New returns an Executor.
@@ -366,6 +375,12 @@ func (e *Executor) publish(
 	}
 	if sess.creds.Forge == nil {
 		return errors.New("executor: the agent made changes but no forge is configured to open a pull request")
+	}
+
+	if e.cfg.ApprovePR {
+		if err := e.awaitApproval(ctx, task, worktree, result, sess, rep); err != nil {
+			return err
+		}
 	}
 
 	e.emit(ctx, task.TaskID, protocol.EventStage, protocol.StagePayload{Name: "open-pull-request"}, rep)
@@ -737,7 +752,11 @@ func (e *Executor) emit(ctx context.Context, taskID string, kind protocol.EventK
 }
 
 func (e *Executor) state(ctx context.Context, taskID string, status protocol.TaskStatus, reason string, rep Reporter) {
-	st := protocol.TaskState{State: status, Reason: reason}
+	e.stateWith(ctx, taskID, protocol.TaskState{State: status, Reason: reason}, rep)
+}
+
+func (e *Executor) stateWith(ctx context.Context, taskID string, st protocol.TaskState, rep Reporter) {
+	status := st.State
 
 	// Journal first, as with events: a state Cloud never received is still
 	// the answer to a history query later.

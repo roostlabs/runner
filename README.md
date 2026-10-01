@@ -41,7 +41,9 @@ Working today:
   container's share — streamed every five seconds, but only while a dashboard
   is subscribed
 
-Not there yet: human approval mid-task.
+- optionally, a hold before anything leaves the server: with `agent.approvePr`
+  on, the commit is made and the task waits for the developer to approve the
+  pull request from the dashboard; declined work stays on its branch on the VPS
 
 ## Install
 
@@ -111,7 +113,8 @@ The config is JSON and must be mode `0600`:
     "model": "claude-opus-5",
     "effort": "xhigh",
     "maxSteps": 40,
-    "budgetUsd": 5
+    "budgetUsd": 5,
+    "approvePr": false
   },
   "git": {
     "authorName": "Roost",
@@ -207,6 +210,17 @@ back with the same result it already produced earns the model a warning in the
 result, and the third identical pass fails the task as looping. The same
 command with a different output counts as progress; `write_file` is never
 counted, since rewriting a file is how a model retries.
+
+`agent.approvePr` adds a human step before the only moment the Runner itself
+acts outside the server. The agent's work is committed on the task branch,
+then the task is reported as `awaiting_approval` with the agent's title and
+summary, and nothing is pushed until the dashboard answers. Approved, it goes
+on to the pull request; declined, the task fails with that reason, the commit
+stays in the clone on the VPS, and the ticket is told. It is off by default
+because the service account cannot merge, so a pull request is already a review
+step; this is for the developer who wants to read the change before it exists
+anywhere but their own machine. A waiting task holds the single execution slot,
+so it gives up after `agent.approvalTimeoutSec` (a day when unset).
 
 `ROOST_CONFIG` overrides the config path, `ROOST_DATA_DIR` the data directory.
 

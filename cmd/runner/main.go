@@ -122,8 +122,10 @@ func run() error {
 		Store: store,
 		// Resolved per task rather than captured here: Managed mode replaces
 		// credentials while the Runner is running.
-		Creds:     svc.currentCreds,
-		BudgetUSD: cfg.Agent.BudgetUSD,
+		Creds:           svc.currentCreds,
+		BudgetUSD:       cfg.Agent.BudgetUSD,
+		ApprovePR:       cfg.Agent.ApprovePR,
+		ApprovalTimeout: cfg.Agent.ApprovalTimeout(),
 		Tickets: executor.Tickets{
 			InProgress: cfg.Tracker.States.InProgress,
 			InReview:   cfg.Tracker.States.InReview,
@@ -459,7 +461,15 @@ func (s *service) handle(ctx context.Context, c *channel.Conn, env protocol.Enve
 		return nil
 
 	case protocol.TypeTaskApprove:
-		return s.replyError(ctx, c, env.ID, protocol.ErrTaskNotFound, "no task is awaiting approval")
+		var approve protocol.TaskApprove
+		if err := env.Decode(&approve); err != nil {
+			return s.replyError(ctx, c, env.ID, protocol.ErrInternal, err.Error())
+		}
+		if err := s.exec.Approve(approve.TaskID, approve.StepID, approve.Approved); err != nil {
+			return s.replyError(ctx, c, env.ID, protocol.ErrTaskNotFound, err.Error())
+		}
+		s.log.Info("approval received", "taskId", approve.TaskID, "step", approve.StepID, "approved", approve.Approved)
+		return nil
 
 	case protocol.TypeCredSet:
 		// Local mode is the default, so the message is not even decoded until
@@ -559,6 +569,8 @@ func (s *service) startTask(task protocol.TaskRun, ref string) {
 			// differently from a task that broke.
 			s.log.Warn("task stopped on budget", "taskId", task.TaskID, "err", err)
 			s.sendError(ref, protocol.ErrBudgetExceeded, err.Error())
+		case errors.Is(err, executor.ErrDeclined):
+			s.log.Info("task stopped: the pull request was declined", "taskId", task.TaskID)
 		case errors.Is(err, agent.ErrLoop):
 			// Not a crash: the agent was stopped on purpose, which the log
 			// should say before anyone goes looking for a bug.

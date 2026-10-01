@@ -151,6 +151,20 @@ type Agent struct {
 	BudgetUSD float64 `json:"budgetUsd,omitempty"`
 	// BaseURL overrides the API endpoint, for a proxy or a test.
 	BaseURL string `json:"baseUrl,omitempty"`
+	// ApprovePR holds every task that made a change until the developer
+	// approves the pull request from the dashboard. Off by default: the
+	// service account cannot merge, so a pull request is already a review
+	// step; this is for the developer who wants to see the change before
+	// it leaves the server at all.
+	ApprovePR bool `json:"approvePr,omitempty"`
+	// ApprovalTimeoutSec is how long such a task waits before failing. Zero
+	// means a day. While it waits it holds the single execution slot.
+	ApprovalTimeoutSec int `json:"approvalTimeoutSec,omitempty"`
+}
+
+// ApprovalTimeout is ApprovalTimeoutSec as a duration; zero when unset.
+func (a Agent) ApprovalTimeout() time.Duration {
+	return time.Duration(a.ApprovalTimeoutSec) * time.Second
 }
 
 // Sandbox configures the containers tasks run in.
