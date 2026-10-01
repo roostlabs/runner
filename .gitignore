@@ -8,3 +8,6 @@
 *.db-shm
 /vendor/
 .DS_Store
+
+# Local working notes, not part of the project.
+CLAUDE.md
