@@ -39,3 +39,15 @@ jobs:
 
       - name: build
         run: make build
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the container
+        run: docker build --build-arg VERSION=ci -t runner:ci .
+      - name: the container runs the binary as a non-root user
+        run: |
+          test "$(docker run --rm --entrypoint id runner:ci -u)" = 1000
+          docker run --rm runner:ci -version
+          docker run --rm --entrypoint sh runner:ci -c 'git --version && docker --version'

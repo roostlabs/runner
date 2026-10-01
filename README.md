@@ -81,6 +81,36 @@ has nowhere to run.
 macOS and Windows are not supported by the installer, and whether they ever
 should be is still open. Build and run the binary directly there.
 
+### With Docker Compose
+
+For a box where compose is how services are run, `docker-compose.yml` runs the
+same binary from `ghcr.io/roostlabs/runner` (amd64 and arm64, published with
+every release) with git and the docker CLI beside it:
+
+```bash
+git clone https://github.com/roostlabs/runner && cd runner
+cp config.example.json config/config.json && chmod 600 config/config.json   # then edit
+echo "DOCKER_GID=$(stat -c %g /var/run/docker.sock)" > .env
+sudo install -d -o 1000 -g 1000 /var/lib/roost
+docker compose up -d
+```
+
+The container does not run Docker. It talks to the host daemon over the
+mounted socket, so every sandbox is a sibling container on the host, started by
+a Runner that happens to live in a container too. Two consequences follow, and
+the compose file is built around them. The data directory is mounted at the
+same path inside as on the host, because the Runner hands checkout paths to
+`docker run -v` and the host daemon resolves them; set `ROOST_DATA_DIR` in
+`.env` to move it, and leave `dataDir` out of the config. And the Runner runs
+as uid 1000, not root, so `DOCKER_GID` has to be the group that owns the socket
+on your host; it differs between distributions, which is why it is read rather
+than written.
+
+The Runner's own root filesystem is read-only, with `no-new-privileges`; the
+config directory is mounted read-write because Managed mode writes credentials
+into it. `make image` builds the same image locally, and `build:` in the
+compose file swaps it in.
+
 ## Build and run
 
 ```bash

@@ -12,10 +12,16 @@ PLATFORMS := linux/amd64 linux/arm64
 
 export CGO_ENABLED := 0
 
-.PHONY: build check test dist clean lint-install
+IMAGE := ghcr.io/roostlabs/runner
+
+.PHONY: build check test dist clean lint-install image
 
 build:
 	go build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN) ./cmd/runner
+
+# image builds the container docker-compose.yml runs, for the current platform.
+image:
+	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
 check:
 	gofmt -l .

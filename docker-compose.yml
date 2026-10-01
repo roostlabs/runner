@@ -1,0 +1,51 @@
+# The Runner under docker compose. An alternative to install.sh for a box where
+# compose is how services are run; the result is the same process with the
+# same config.
+#
+#   cp config.example.json config/config.json   # then edit; mode 0600
+#   echo "DOCKER_GID=$(stat -c %g /var/run/docker.sock)" > .env
+#   sudo install -d -o 1000 -g 1000 /var/lib/roost
+#   docker compose up -d
+#
+# Two things here are not optional.
+#
+# The data directory is mounted at the same path inside as on the host, and
+# ROOST_DATA_DIR tells the Runner to use it. The Runner starts every sandbox
+# with `docker run -v <checkout>:/work` through the host's socket, and the
+# daemon resolves that path on the host; a different path inside the container
+# would mount the wrong directory, or none. Leave dataDir out of the config,
+# or set it to the same path.
+#
+# DOCKER_GID is the group that owns /var/run/docker.sock on the host. The Runner
+# runs as uid 1000, not root, and that group is how it is allowed to talk to
+# the daemon. The number differs between distributions, which is why it is read
+# from the socket rather than written here.
+
+services:
+  runner:
+    image: ghcr.io/roostlabs/runner:${ROOST_VERSION:-latest}
+    # To run a build of your own instead of the published image:
+    # build:
+    #   context: .
+    restart: unless-stopped
+    init: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${ROOST_DATA_DIR:-/var/lib/roost}:${ROOST_DATA_DIR:-/var/lib/roost}
+      # Read-write: in Managed mode the Runner writes credentials into it.
+      - ./config:/etc/roost
+    environment:
+      # Same value as the volume above, so the path is identical by construction.
+      ROOST_DATA_DIR: ${ROOST_DATA_DIR:-/var/lib/roost}
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID to the gid of /var/run/docker.sock}"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

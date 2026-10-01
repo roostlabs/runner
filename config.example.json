@@ -1,0 +1,19 @@
+{
+  "cloudUrl": "wss://cloud.example.com/channel",
+  "token": "<from the dashboard>",
+  "dataDir": "/var/lib/roost",
+  "creds": {
+    "mode": "local",
+    "git": "",
+    "taskManager": "",
+    "llm": ""
+  },
+  "sandbox": {
+    "image": "golang:1.26",
+    "network": "bridge"
+  },
+  "agent": {
+    "model": "claude-opus-5",
+    "budgetUsd": 5
+  }
+}

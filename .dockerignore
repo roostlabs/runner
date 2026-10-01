@@ -1,0 +1,8 @@
+.git
+dist
+roost-runner
+*.md
+.github
+# Never into a build layer: the real config holds every credential.
+config
+.env
