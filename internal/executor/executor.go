@@ -313,6 +313,7 @@ func (e *Executor) execute(ctx context.Context, task protocol.TaskRun, rep Repor
 	spec := e.cfg.Sandbox
 	spec.HostPath = worktree.Path
 	spec.Env = sess.creds.Env
+	spec.TaskID = task.TaskID
 	if spec.Image == "" {
 		return errors.New("executor: no sandbox image configured; set sandbox.image in the runner config")
 	}

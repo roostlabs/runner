@@ -45,6 +45,21 @@ func TestArgsNeverCarryCredentialValues(t *testing.T) {
 	}
 }
 
+func TestArgsLabelTheContainerWithTheTask(t *testing.T) {
+	spec := testSpec()
+	spec.TaskID = "t-7"
+	if args := spec.Args([]string{"true"}); !slices.Contains(args, "--label=roost.task=t-7") {
+		t.Errorf("args lack the task label: %v", args)
+	}
+	if args := testSpec().Args([]string{"true"}); slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "--label=") }) {
+		t.Errorf("a spec with no task got a label: %v", args)
+	}
+	// The reader and the writer agree on the label name.
+	if TaskLabel != "roost.task" {
+		t.Errorf("TaskLabel = %q", TaskLabel)
+	}
+}
+
 func TestArgsAppliesLimits(t *testing.T) {
 	spec := testSpec()
 	spec.CPUs = "2"

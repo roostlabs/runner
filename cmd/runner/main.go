@@ -34,6 +34,7 @@ import (
 	"github.com/roostlabs/runner/internal/executor"
 	"github.com/roostlabs/runner/internal/forge"
 	"github.com/roostlabs/runner/internal/llm"
+	"github.com/roostlabs/runner/internal/metrics"
 	"github.com/roostlabs/runner/internal/redact"
 	"github.com/roostlabs/runner/internal/repo"
 	"github.com/roostlabs/runner/internal/sandbox"
@@ -111,6 +112,7 @@ func run() error {
 		store:      store,
 		repos:      repos,
 		log:        log,
+		sampler:    &metrics.Sampler{DataDir: cfg.DataDir},
 	}
 	svc.cfg.Store(&cfg)
 	svc.creds.Store(&creds)
@@ -327,6 +329,11 @@ type service struct {
 	// conn is the current connection, replaced on every reconnect. A task that
 	// outlives a connection reports onto whatever is current when it writes.
 	conn atomic.Pointer[channel.Conn]
+
+	// sampler reads host usage; metrics is the loop that sends it while Cloud
+	// is subscribed.
+	sampler *metrics.Sampler
+	metrics metricsStream
 }
 
 // config is the configuration as it stands now, which Managed mode can change.
@@ -393,6 +400,9 @@ func (s *service) setCred(key protocol.CredKey, value string) error {
 // connection including reconnects, since Cloud keeps minimal state of its own.
 func (s *service) onConnect(ctx context.Context, c *channel.Conn) error {
 	s.conn.Store(c)
+	// A subscription belongs to a connection; Cloud asks again if it still
+	// has a dashboard watching.
+	s.stopMetrics()
 
 	if err := c.SendMessage(ctx, protocol.TypeCredStatus, s.config().Creds.Status()); err != nil {
 		return err
@@ -489,8 +499,17 @@ func (s *service) handle(ctx context.Context, c *channel.Conn, env protocol.Enve
 		if err := env.Decode(&sub); err != nil {
 			return s.replyError(ctx, c, env.ID, protocol.ErrInternal, err.Error())
 		}
-		s.log.Info("stream subscription ignored; metrics are not implemented",
-			"type", env.Type, "stream", sub.Stream)
+		if sub.Stream != protocol.StreamMetrics {
+			// Unknown streams are ignored like unknown types: a newer Cloud
+			// may know one this Runner does not.
+			s.log.Debug("ignoring a subscription to an unknown stream", "stream", sub.Stream)
+			return nil
+		}
+		if env.Type == protocol.TypeSubscribe {
+			s.startMetrics(c)
+		} else {
+			s.stopMetrics()
+		}
 		return nil
 
 	case protocol.TypeChat:

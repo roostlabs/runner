@@ -40,6 +40,11 @@ const (
 	NetworkNone   = "none"
 )
 
+// TaskLabel is the container label naming the task a sandbox runs for. The
+// metrics package reads it back from docker ps; it is declared here so the
+// writer and the reader cannot drift apart.
+const TaskLabel = "roost.task"
+
 // Spec describes one container.
 type Spec struct {
 	// Image is the container image, e.g. golang:1.26. It comes from the repo's
@@ -54,6 +59,9 @@ type Spec struct {
 	// Env are KEY=VALUE pairs to expose. The values are passed through the
 	// Runner's own environment rather than the command line — see Args.
 	Env []string
+	// TaskID labels the container with the task running it, so the metrics
+	// stream can put a container's usage against a task. Empty adds no label.
+	TaskID string
 	// User is the uid:gid to run as. Set it to the Runner's own so files the
 	// container writes into the working copy stay usable on the host; empty
 	// means root, which leaves root-owned files behind in a persistent repo.
@@ -145,6 +153,9 @@ func (s Spec) Args(argv []string) []string {
 	}
 	if s.User != "" {
 		args = append(args, "--user="+s.User)
+	}
+	if s.TaskID != "" {
+		args = append(args, "--label="+TaskLabel+"="+s.TaskID)
 	}
 	for _, kv := range s.Env {
 		if name, _, ok := strings.Cut(kv, "="); ok && name != "" {

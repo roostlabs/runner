@@ -35,7 +35,11 @@ Working today:
   state and starts a task per ticket, so a ticket filed at night is a pull
   request in the morning without anyone opening the dashboard
 
-Not there yet: metrics and human approval mid-task.
+- host and sandbox metrics — CPU, memory, disk, load, and each running
+  container's share — streamed every five seconds, but only while a dashboard
+  is subscribed
+
+Not there yet: human approval mid-task.
 
 ## Install
 
@@ -251,6 +255,7 @@ work. `"network": "none"` is available today for tasks that need nothing externa
 | `internal/sandbox` | disposable containers under limits |
 | `internal/redact` | masks credential values in streamed output |
 | `internal/llm` | the Anthropic Messages API, and what a call cost |
+| `internal/metrics` | reads host usage from /proc and container usage from docker |
 | `internal/forge` | opens the pull request the work becomes, on GitHub or GitLab |
 | `internal/tracker` | reads, moves and comments on the ticket, in Jira or Linear |
 | `internal/agent` | decides a task's work; a model, or a fixed command list |
