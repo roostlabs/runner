@@ -9,6 +9,7 @@ import (
 
 	"github.com/roostlabs/protocol"
 	"github.com/roostlabs/runner/internal/agent"
+	"github.com/roostlabs/runner/internal/alert"
 	"github.com/roostlabs/runner/internal/repo"
 )
 
@@ -105,6 +106,18 @@ func (e *Executor) awaitApproval(
 		StepID: ApprovalStep,
 	}, rep)
 	e.log.Info("waiting for approval", "taskId", task.TaskID, "branch", worktree.Branch, "timeout", timeout)
+	if e.cfg.Alerts != nil {
+		// The one alert that asks for something: the developer has to come
+		// and press a button, and without this they would not know to.
+		cost, _, _ := sess.totals()
+		e.cfg.Alerts.Alert(ctx, alert.Event{
+			Kind:    alert.KindApproval,
+			TaskID:  task.TaskID,
+			Ticket:  alertTicket(task.Ticket),
+			Reason:  sess.scrub(strings.TrimSpace(result.Title)),
+			CostUSD: cost,
+		})
+	}
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()

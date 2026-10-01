@@ -49,6 +49,91 @@ type Config struct {
 	Git Git `json:"git"`
 	// Tracker connects the task manager the tickets live in.
 	Tracker Tracker `json:"tracker"`
+	// Alerts tells the developer when a task needs them.
+	Alerts Alerts `json:"alerts"`
+}
+
+// Alerts configures where the Runner reports a task that finished, failed,
+// ran out of budget or is waiting for approval.
+//
+// It lives here, on the VPS, because a bot token is a credential and
+// credentials live on the VPS. Both sinks are optional; with neither set no
+// alert is sent and the dashboard is the only place to look.
+type Alerts struct {
+	// Events narrows what is sent: done, failed, budget, awaiting_approval.
+	// Empty sends all four.
+	Events []string `json:"events,omitempty"`
+	// Telegram sends to one chat through a bot.
+	Telegram TelegramAlerts `json:"telegram"`
+	// Webhook posts the event as JSON to one URL.
+	Webhook WebhookAlerts `json:"webhook"`
+}
+
+// TelegramAlerts is a bot token and the chat it posts to.
+type TelegramAlerts struct {
+	Token  string `json:"token,omitempty"`
+	ChatID string `json:"chatId,omitempty"`
+}
+
+// WebhookAlerts is a URL and an optional secret the body is signed with.
+type WebhookAlerts struct {
+	URL    string `json:"url,omitempty"`
+	Secret string `json:"secret,omitempty"`
+}
+
+// Enabled reports whether any sink is configured.
+func (a Alerts) Enabled() bool {
+	return a.Telegram.Token != "" || a.Webhook.URL != ""
+}
+
+// Secrets lists the values the redaction filter has to know about: the bot
+// token is in the URL of every Telegram request, and the webhook secret
+// signs every body.
+func (a Alerts) Secrets() []string {
+	var vals []string
+	for _, v := range []string{a.Telegram.Token, a.Webhook.Secret} {
+		if v != "" {
+			vals = append(vals, v)
+		}
+	}
+	return vals
+}
+
+// LogValue reports which sinks are set, never their values.
+func (a Alerts) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.Bool("telegram", a.Telegram.Token != ""),
+		slog.Bool("webhook", a.Webhook.URL != ""),
+	)
+}
+
+var alertEvents = map[string]bool{"done": true, "failed": true, "budget": true, "awaiting_approval": true}
+
+func (a Alerts) validate() error {
+	for _, ev := range a.Events {
+		if !alertEvents[ev] {
+			return fmt.Errorf("config: alerts.events %q is not one of done, failed, budget, awaiting_approval", ev)
+		}
+	}
+	if (a.Telegram.Token == "") != (a.Telegram.ChatID == "") {
+		return errors.New("config: alerts.telegram needs both token and chatId")
+	}
+	if a.Webhook.URL != "" {
+		u, err := url.Parse(a.Webhook.URL)
+		if err != nil || u.Host == "" {
+			return fmt.Errorf("config: alerts.webhook.url %q is not a url", a.Webhook.URL)
+		}
+		// The body names the ticket and the failure; over plain http to a
+		// remote host anyone on the path reads it, and the signature would
+		// not help with that.
+		if u.Scheme != "https" && !(u.Scheme == "http" && isLoopback(u.Hostname())) {
+			return fmt.Errorf("config: alerts.webhook.url %q must be https", a.Webhook.URL)
+		}
+	}
+	if a.Webhook.URL == "" && a.Webhook.Secret != "" {
+		return errors.New("config: alerts.webhook.secret is set but url is empty")
+	}
+	return nil
 }
 
 // Tracker configures the task-manager connector.
@@ -417,7 +502,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("config: creds.mode %q, want %q or %q",
 			c.Creds.Mode, protocol.CredModeLocal, protocol.CredModeManaged)
 	}
-	return c.Tracker.validate()
+	if err := c.Tracker.validate(); err != nil {
+		return err
+	}
+	return c.Alerts.validate()
 }
 
 // validate checks what can be checked without the credential: which tracker,

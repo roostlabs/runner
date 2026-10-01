@@ -25,6 +25,7 @@ import (
 
 	"github.com/roostlabs/protocol"
 	"github.com/roostlabs/runner/internal/agent"
+	"github.com/roostlabs/runner/internal/alert"
 	"github.com/roostlabs/runner/internal/eventstore"
 	"github.com/roostlabs/runner/internal/forge"
 	"github.com/roostlabs/runner/internal/llm"
@@ -127,6 +128,11 @@ type Config struct {
 	// Sandbox is the template for every container: image and limits. HostPath
 	// and Env are filled in per task.
 	Sandbox sandbox.Spec
+	// Alerts is told when a task finishes, fails, hits its budget or waits
+	// for approval. Nil sends nothing. It is never on the task's path: a
+	// sink that is down costs a log line, not a task.
+	Alerts Alerter
+
 	// ApprovePR parks every task that produced a change until the developer
 	// approves the pull request, via Approve. The commit is made first, so
 	// what is approved is exactly what is pushed.
@@ -139,6 +145,11 @@ type Config struct {
 	// Run defaults to sandbox.Run.
 	Run    RunFunc
 	Logger *slog.Logger
+}
+
+// Alerter is what Config.Alerts has to be; alert.Notifier is one.
+type Alerter interface {
+	Alert(ctx context.Context, ev alert.Event)
 }
 
 // Executor runs tasks.
@@ -271,7 +282,39 @@ func (e *Executor) Run(ctx context.Context, task protocol.TaskRun, rep Reporter)
 	if repErr := rep.TaskResult(reportCtx, task.TaskID, result); repErr != nil {
 		e.log.Debug("could not report the result", "taskId", task.TaskID, "err", repErr)
 	}
+	e.alertResult(reportCtx, sess, err, result)
 	return err
+}
+
+// alertResult tells the developer how the task ended. A cancelled task is
+// not reported: the developer did that themselves.
+func (e *Executor) alertResult(ctx context.Context, sess *session, err error, result protocol.TaskResult) {
+	if e.cfg.Alerts == nil {
+		return
+	}
+	ev := alert.Event{
+		TaskID:  sess.task.TaskID,
+		Ticket:  alertTicket(sess.task.Ticket),
+		PRURL:   result.PRURL,
+		CostUSD: result.CostUSD,
+	}
+	switch {
+	case err == nil:
+		ev.Kind = alert.KindDone
+	case errors.Is(err, context.Canceled):
+		return
+	case errors.Is(err, agent.ErrBudget):
+		ev.Kind = alert.KindBudget
+		ev.Reason = sess.scrub(err.Error())
+	default:
+		ev.Kind = alert.KindFailed
+		ev.Reason = sess.scrub(err.Error())
+	}
+	e.cfg.Alerts.Alert(ctx, ev)
+}
+
+func alertTicket(t protocol.Ticket) alert.Ticket {
+	return alert.Ticket{Provider: t.Provider, ID: t.ID, URL: t.URL, Title: t.Title}
 }
 
 func (e *Executor) execute(ctx context.Context, task protocol.TaskRun, rep Reporter, sess *session) error {

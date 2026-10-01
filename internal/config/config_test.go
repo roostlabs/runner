@@ -226,6 +226,18 @@ func TestValidate(t *testing.T) {
 		{"empty url", func(c *Config) { c.CloudURL = "" }, true},
 		{"empty token", func(c *Config) { c.Token = "" }, true},
 		{"empty data dir", func(c *Config) { c.DataDir = "" }, true},
+		{"telegram alerts", func(c *Config) {
+			c.Alerts.Telegram = TelegramAlerts{Token: "1:a", ChatID: "7"}
+		}, false},
+		{"telegram without a chat id", func(c *Config) {
+			c.Alerts.Telegram = TelegramAlerts{Token: "1:a"}
+		}, true},
+		{"https webhook", func(c *Config) { c.Alerts.Webhook.URL = "https://hooks.example.com/x" }, false},
+		{"http webhook to a remote host", func(c *Config) { c.Alerts.Webhook.URL = "http://hooks.example.com/x" }, true},
+		{"http webhook to loopback", func(c *Config) { c.Alerts.Webhook.URL = "http://127.0.0.1:9000/x" }, false},
+		{"webhook secret without a url", func(c *Config) { c.Alerts.Webhook.Secret = "s" }, true},
+		{"known alert events", func(c *Config) { c.Alerts.Events = []string{"failed", "awaiting_approval"} }, false},
+		{"unknown alert event", func(c *Config) { c.Alerts.Events = []string{"started"} }, true},
 		{"local mode", func(c *Config) { c.Creds.Mode = protocol.CredModeLocal }, false},
 		{"managed mode", func(c *Config) { c.Creds.Mode = protocol.CredModeManaged }, false},
 		// A typo must not fail open in the direction that lets Cloud write.

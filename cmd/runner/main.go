@@ -28,6 +28,7 @@ import (
 
 	"github.com/roostlabs/protocol"
 	"github.com/roostlabs/runner/internal/agent"
+	"github.com/roostlabs/runner/internal/alert"
 	"github.com/roostlabs/runner/internal/channel"
 	"github.com/roostlabs/runner/internal/config"
 	"github.com/roostlabs/runner/internal/eventstore"
@@ -124,6 +125,7 @@ func run() error {
 		// credentials while the Runner is running.
 		Creds:           svc.currentCreds,
 		BudgetUSD:       cfg.Agent.BudgetUSD,
+		Alerts:          newAlerter(cfg, log),
 		ApprovePR:       cfg.Agent.ApprovePR,
 		ApprovalTimeout: cfg.Agent.ApprovalTimeout(),
 		Tickets: executor.Tickets{
@@ -142,7 +144,7 @@ func run() error {
 		"version", Version, "cloud", cfg.CloudURL, "dataDir", cfg.DataDir,
 		"creds", cfg.Creds, "docker", docker, "image", cfg.Sandbox.Image,
 		"agent", agentKind(creds.LLM), "model", modelName(creds.LLM),
-		"budgetUsd", cfg.Agent.BudgetUSD, "tracker", cfg.Tracker.Kind)
+		"budgetUsd", cfg.Agent.BudgetUSD, "tracker", cfg.Tracker.Kind, "alerts", cfg.Alerts)
 
 	if cfg.Tracker.Polling() {
 		// Polling is the Runner's own trigger: with no port open on the VPS a
@@ -192,9 +194,30 @@ func buildCreds(cfg config.Config) (executor.Creds, error) {
 		Tracker: tickets,
 		// The filter can only mask values it was told about, which is exactly
 		// the set the sandbox is given.
-		Filter: redact.New(cfg.Creds.Values()...),
+		// The alert secrets are not handed to the sandbox, but they leave
+		// the box in every alert request, so they are masked all the same.
+		Filter: redact.New(append(cfg.Creds.Values(), cfg.Alerts.Secrets()...)...),
 		Env:    cfg.Creds.Env(),
 	}, nil
+}
+
+// newAlerter builds the sinks the config names, or nothing.
+func newAlerter(cfg config.Config, log *slog.Logger) executor.Alerter {
+	if !cfg.Alerts.Enabled() {
+		return nil
+	}
+	var sinks []alert.Sink
+	if cfg.Alerts.Telegram.Token != "" {
+		sinks = append(sinks, alert.Telegram{Token: cfg.Alerts.Telegram.Token, ChatID: cfg.Alerts.Telegram.ChatID})
+	}
+	if cfg.Alerts.Webhook.URL != "" {
+		sinks = append(sinks, alert.Webhook{URL: cfg.Alerts.Webhook.URL, Secret: cfg.Alerts.Webhook.Secret})
+	}
+	kinds := make([]alert.Kind, 0, len(cfg.Alerts.Events))
+	for _, ev := range cfg.Alerts.Events {
+		kinds = append(kinds, alert.Kind(ev))
+	}
+	return alert.New(log, kinds, sinks...)
 }
 
 // newAgent picks what decides a task's work.

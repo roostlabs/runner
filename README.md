@@ -41,6 +41,9 @@ Working today:
   container's share — streamed every five seconds, but only while a dashboard
   is subscribed
 
+- alerts to Telegram and to a webhook when a task finishes, fails, stops at
+  its budget or waits for approval, sent from the VPS so the bot token stays
+  there with the other credentials
 - optionally, a hold before anything leaves the server: with `agent.approvePr`
   on, the commit is made and the task waits for the developer to approve the
   pull request from the dashboard; declined work stays on its branch on the VPS
@@ -164,6 +167,11 @@ The config is JSON and must be mode `0600`:
       "inProgress": "In Progress",
       "inReview": "In Review"
     }
+  },
+  "alerts": {
+    "events": ["failed", "budget", "awaiting_approval", "done"],
+    "telegram": { "token": "<from @BotFather>", "chatId": "<your chat>" },
+    "webhook": { "url": "https://hooks.example.com/roost", "secret": "<shared>" }
   }
 }
 ```
@@ -252,6 +260,20 @@ step; this is for the developer who wants to read the change before it exists
 anywhere but their own machine. A waiting task holds the single execution slot,
 so it gives up after `agent.approvalTimeoutSec` (a day when unset).
 
+`alerts` is how the Runner reaches the developer who is not watching the
+dashboard: a task that opened a pull request, failed, stopped at its budget,
+or is waiting to be approved. Two sinks, both optional. `telegram` posts to one
+chat through a bot made with @BotFather (message the bot once, then read your
+chat id from its `getUpdates`). `webhook` posts the event as JSON to one URL,
+with the same text a chat would show under `text`, and signs the body with
+`X-Roost-Signature: sha256=<hmac>` when a `secret` is set, so the receiver can
+tell the Runner's posts from anyone else's; the URL must be `https` unless it
+is loopback. `events` narrows the set. The alerts are sent from the VPS, not
+from Cloud, because a bot token is a credential and credentials live on the
+VPS; the token and the secret are added to the redaction filter like the
+rest. Delivery is best effort: a sink that is down costs a log line, never a
+task. A cancelled task sends nothing, since the developer did that themselves.
+
 `ROOST_CONFIG` overrides the config path, `ROOST_DATA_DIR` the data directory.
 
 ## What the design is protecting
@@ -311,6 +333,7 @@ work. `"network": "none"` is available today for tasks that need nothing externa
 | `internal/metrics` | reads host usage from /proc and container usage from docker |
 | `internal/forge` | opens the pull request the work becomes, on GitHub or GitLab |
 | `internal/tracker` | reads, moves and comments on the ticket, in Jira or Linear |
+| `internal/alert` | tells the developer, over Telegram or a webhook, when a task needs them |
 | `internal/agent` | decides a task's work; a model, or a fixed command list |
 | `internal/executor` | runs a task, reports it throughout, and holds the budget |
 | `install.sh` | the one-liner installer: prerequisites, service account, systemd unit |
