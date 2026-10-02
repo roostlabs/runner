@@ -9,13 +9,19 @@
 # directory at the same path inside as on the host: the Runner passes a
 # checkout path to `docker run -v`, and the daemon resolves it on the host.
 
-FROM golang:1.26-alpine AS build
+# The build stage runs on the builder's own architecture and cross-compiles
+# for the target, so a multi-arch build never runs the compiler under
+# emulation; only the final stage is per platform.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 ARG VERSION=dev
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=${VERSION}" \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags "-s -w -X main.Version=${VERSION}" \
       -o /out/roost-runner ./cmd/runner
 
 FROM alpine:3.21
