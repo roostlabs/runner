@@ -331,3 +331,15 @@ func TestRunReadOnlyRootBlocksWrites(t *testing.T) {
 		t.Errorf("could not write to the working copy, exit code %d", res.ExitCode)
 	}
 }
+
+// A toolchain in the sandbox has no real home, so it is given one on the
+// scratch tmpfs. Without this, `go build` fails on a read-only root with
+// "failed to initialize build cache at /.cache/go-build".
+func TestArgsGiveTheToolchainAHome(t *testing.T) {
+	args := strings.Join(Spec{Image: "golang:1.26", HostPath: "/w", ReadOnlyRoot: true}.Args([]string{"go", "build"}), " ")
+	for _, want := range []string{"-e HOME=/tmp", "-e XDG_CACHE_HOME=/tmp/.cache"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("args lack %q: %s", want, args)
+		}
+	}
+}

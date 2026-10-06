@@ -151,6 +151,15 @@ func (s Spec) Args(argv []string) []string {
 			"--read-only",
 			fmt.Sprintf("--tmpfs=/tmp:rw,exec,nosuid,size=%dm", s.TmpfsMB))
 	}
+	// The container runs as a user the image has never heard of, with a
+	// read-only root: there is no home directory and nowhere to make one.
+	// Toolchains want a home for their caches — Go's build cache, npm's,
+	// pip's — so they are pointed at the scratch space, which is the only
+	// place that is writable and large enough.
+	args = append(args,
+		"-e", "HOME=/tmp",
+		"-e", "XDG_CACHE_HOME=/tmp/.cache",
+		"-e", "XDG_CONFIG_HOME=/tmp/.config")
 	if s.User != "" {
 		args = append(args, "--user="+s.User)
 	}
