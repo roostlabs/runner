@@ -110,7 +110,7 @@ func (m Model) Run(ctx context.Context, task protocol.TaskRun, s Session) (Resul
 				results = append(results, llm.ToolResult(use.ID, out, false))
 				continue
 			}
-			out, isErr := m.runTool(ctx, s, use)
+			out, isErr := runTool(ctx, s, use.Name, use.Input)
 			switch repeats := guard.observe(use.Name, use.Input, out); {
 			case repeats >= loopStopAt:
 				return Result{}, fmt.Errorf("%w: %s repeated %d times with the same result", ErrLoop, use.Name, repeats)
@@ -235,13 +235,13 @@ func taskPrompt(task protocol.TaskRun) string {
 // runTool carries out one tool call, reporting failures back to the model
 // rather than ending the task: a bad path or a failing command is something the
 // model can recover from, and usually does.
-func (m Model) runTool(ctx context.Context, s Session, use llm.Block) (string, bool) {
-	switch use.Name {
+func runTool(ctx context.Context, s Session, name string, input json.RawMessage) (string, bool) {
+	switch name {
 	case toolBash:
 		var in struct {
 			Command string `json:"command"`
 		}
-		if err := json.Unmarshal(use.Input, &in); err != nil {
+		if err := json.Unmarshal(input, &in); err != nil {
 			return "invalid input: " + err.Error(), true
 		}
 		if strings.TrimSpace(in.Command) == "" {
@@ -260,7 +260,7 @@ func (m Model) runTool(ctx context.Context, s Session, use llm.Block) (string, b
 		var in struct {
 			Path string `json:"path"`
 		}
-		if err := json.Unmarshal(use.Input, &in); err != nil {
+		if err := json.Unmarshal(input, &in); err != nil {
 			return "invalid input: " + err.Error(), true
 		}
 		content, err := s.ReadFile(in.Path)
@@ -274,7 +274,7 @@ func (m Model) runTool(ctx context.Context, s Session, use llm.Block) (string, b
 			Path    string `json:"path"`
 			Content string `json:"content"`
 		}
-		if err := json.Unmarshal(use.Input, &in); err != nil {
+		if err := json.Unmarshal(input, &in); err != nil {
 			return "invalid input: " + err.Error(), true
 		}
 		if err := s.WriteFile(in.Path, in.Content); err != nil {
@@ -283,7 +283,7 @@ func (m Model) runTool(ctx context.Context, s Session, use llm.Block) (string, b
 		return fmt.Sprintf("wrote %s (%d bytes)", in.Path, len(in.Content)), false
 
 	default:
-		return fmt.Sprintf("unknown tool %q", use.Name), true
+		return fmt.Sprintf("unknown tool %q", name), true
 	}
 }
 

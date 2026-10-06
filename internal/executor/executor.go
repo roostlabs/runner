@@ -669,6 +669,44 @@ func (s *session) Complete(ctx context.Context, req llm.Request) (llm.Response, 
 	return resp, nil
 }
 
+// Charge books a model call the agent made itself. The budget is checked
+// after the fact, which is all that is possible here: the call has happened.
+func (s *session) Charge(ctx context.Context, call agent.Charge) error {
+	s.mu.Lock()
+	s.cost += call.CostUSD
+	s.tokens.In += call.Tokens.In
+	s.tokens.Out += call.Tokens.Out
+	spent := s.cost
+	s.mu.Unlock()
+
+	s.ex.emit(ctx, s.task.TaskID, protocol.EventLLMCall, protocol.LLMCallPayload{
+		Model:      call.Model,
+		Tokens:     call.Tokens,
+		CostUSD:    call.CostUSD,
+		DurationMs: call.DurationMs,
+	}, s.rep)
+
+	if s.budget > 0 && spent >= s.budget {
+		return fmt.Errorf("%w: spent $%.4f of $%.4f", agent.ErrBudget, spent, s.budget)
+	}
+	return nil
+}
+
+// Budget is what the task may still spend. Zero is no cap, so a task with a
+// cap that is already spent reports the smallest positive amount rather than
+// turning into an uncapped one.
+func (s *session) Budget() float64 {
+	if s.budget <= 0 {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if left := s.budget - s.cost; left > 0 {
+		return left
+	}
+	return 0.0001
+}
+
 // Step records what the agent said it is doing. The text is masked: it is the
 // model's own words, and the model has been reading the repository.
 func (s *session) Step(ctx context.Context, text string) {

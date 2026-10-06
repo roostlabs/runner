@@ -204,6 +204,26 @@ mode rather than a stub: a repository whose build and test sequence is fixed
 does not need a model to rediscover it every time. Those commands are argv
 lists, not shell lines.
 
+`agent.backend` picks who thinks. The default, `api`, is the Runner's own loop
+against the Messages API, paid for with `creds.llm`. `claude-code` is for a
+developer on a Claude subscription, who has the `claude` CLI and no API key:
+the Runner runs `claude -p` on the VPS for each task, with the CLI's built-in
+tools switched off and exactly one MCP server switched on — the Runner itself,
+serving `bash`, `read_file`, `write_file` and `submit` over loopback for the
+duration of the task. The model decides on the host; everything it does still
+happens in the sandbox, through the same session, under the same redaction,
+journal and loop guard. Install the CLI on the VPS (`npm install -g
+@anthropic-ai/claude-code`) and sign in once with `claude login`; the Runner
+never reads or forwards that sign-in. `agent.claudeBin` names the binary when
+it is not `claude` on PATH, `agent.model` is passed through as `--model`, and
+`agent.maxSteps` becomes `--max-turns`. Cost comes from the CLI's own result
+record and is booked like any other model call; the remaining budget goes down
+as `--max-budget-usd` so the CLI stops before spending it. Do not set
+`ANTHROPIC_API_KEY` in the Runner's environment with this backend: the CLI
+would bill the key instead of the subscription. This backend is a developer
+using their own subscription through Anthropic's own CLI on their own server;
+if headless use of the CLI is ever restricted, `api` remains.
+
 `git.forge` is `github` or `gitlab`. Leave it empty for github.com and
 gitlab.com, which are recognised by hostname. A self-hosted forge has to say
 which one it is: guessing from a hostname would push a branch and then fail to

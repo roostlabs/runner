@@ -238,6 +238,12 @@ func TestValidate(t *testing.T) {
 		{"webhook secret without a url", func(c *Config) { c.Alerts.Webhook.Secret = "s" }, true},
 		{"known alert events", func(c *Config) { c.Alerts.Events = []string{"failed", "awaiting_approval"} }, false},
 		{"unknown alert event", func(c *Config) { c.Alerts.Events = []string{"started"} }, true},
+		{"api backend", func(c *Config) { c.Agent.Backend = BackendAPI }, false},
+		{"claude-code backend needs no llm key", func(c *Config) {
+			c.Agent.Backend = BackendClaudeCode
+			c.Creds.LLM = ""
+		}, false},
+		{"unknown backend", func(c *Config) { c.Agent.Backend = "openai" }, true},
 		{"local mode", func(c *Config) { c.Creds.Mode = protocol.CredModeLocal }, false},
 		{"managed mode", func(c *Config) { c.Creds.Mode = protocol.CredModeManaged }, false},
 		// A typo must not fail open in the direction that lets Cloud write.

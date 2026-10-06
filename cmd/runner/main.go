@@ -143,7 +143,7 @@ func run() error {
 	log.Info("runner starting",
 		"version", Version, "cloud", cfg.CloudURL, "dataDir", cfg.DataDir,
 		"creds", cfg.Creds, "docker", docker, "image", cfg.Sandbox.Image,
-		"agent", agentKind(creds.LLM), "model", modelName(creds.LLM),
+		"agent", agentKind(cfg, creds.LLM), "model", modelName(creds.LLM),
 		"budgetUsd", cfg.Agent.BudgetUSD, "tracker", cfg.Tracker.Kind, "alerts", cfg.Alerts)
 
 	if cfg.Tracker.Polling() {
@@ -227,6 +227,16 @@ func newAlerter(cfg config.Config, log *slog.Logger) executor.Alerter {
 // which is a real mode: a repository whose build and test sequence is fixed
 // does not need a model to rediscover it every time.
 func newAgent(cfg config.Config) (agent.Agent, *llm.Client, error) {
+	if cfg.Agent.UsesClaudeCode() {
+		// The CLI carries its own sign-in; a key here would be ignored by
+		// the Runner, and only the Runner: the CLI would see one in the
+		// environment and bill it, so the key is not put there.
+		return agent.ClaudeCode{
+			Bin:      cfg.Agent.ClaudeBin,
+			Model:    cfg.Agent.Model,
+			MaxTurns: cfg.Agent.MaxSteps,
+		}, nil, nil
+	}
 	if cfg.Creds.LLM == "" {
 		return agent.FixedFromArgv(cfg.Sandbox.Commands), nil, nil
 	}
@@ -292,11 +302,15 @@ func author(cfg config.Git) repo.Author {
 	return a
 }
 
-func agentKind(model *llm.Client) string {
-	if model == nil {
+func agentKind(cfg config.Config, model *llm.Client) string {
+	switch {
+	case cfg.Agent.UsesClaudeCode():
+		return config.BackendClaudeCode
+	case model == nil:
 		return "fixed"
+	default:
+		return config.BackendAPI
 	}
-	return "model"
 }
 
 func modelName(model *llm.Client) string {

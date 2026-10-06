@@ -247,11 +247,28 @@ type Git struct {
 	APIBase string `json:"apiBase,omitempty"`
 }
 
+// Agent backends: who thinks.
+const (
+	// BackendAPI is the Runner's own loop against the Messages API, paid for
+	// with creds.llm. It is the default.
+	BackendAPI = "api"
+	// BackendClaudeCode drives the developer's own Claude Code CLI, signed in
+	// with their subscription, with this Runner as its only tool server.
+	BackendClaudeCode = "claude-code"
+)
+
 // Agent configures the LLM-driven agent.
 //
-// It is used when creds.llm is set. Without that key the Runner falls back to
-// running sandbox.commands, because an agent with no model is not an agent.
+// With the api backend it is used when creds.llm is set; without that key the
+// Runner falls back to running sandbox.commands, because an agent with no
+// model is not an agent. The claude-code backend needs no key: the CLI on
+// the VPS carries its own sign-in.
 type Agent struct {
+	// Backend is "api" (default) or "claude-code".
+	Backend string `json:"backend,omitempty"`
+	// ClaudeBin is the Claude Code CLI for the claude-code backend. Empty
+	// means "claude" on PATH.
+	ClaudeBin string `json:"claudeBin,omitempty"`
 	// Model is the model id. Empty uses the package default.
 	Model string `json:"model,omitempty"`
 	// Effort is how hard the model thinks per turn: low, medium, high, xhigh
@@ -534,11 +551,20 @@ func (c Config) Validate() error {
 		return fmt.Errorf("config: creds.mode %q, want %q or %q",
 			c.Creds.Mode, protocol.CredModeLocal, protocol.CredModeManaged)
 	}
+	switch c.Agent.Backend {
+	case "", BackendAPI, BackendClaudeCode:
+	default:
+		return fmt.Errorf("config: agent.backend %q, want %q or %q", c.Agent.Backend, BackendAPI, BackendClaudeCode)
+	}
 	if err := c.Tracker.validate(); err != nil {
 		return err
 	}
 	return c.Alerts.validate()
 }
+
+// UsesClaudeCode reports whether the agent thinks through Claude Code rather
+// than the Messages API.
+func (a Agent) UsesClaudeCode() bool { return a.Backend == BackendClaudeCode }
 
 // validate checks what can be checked without the credential: which tracker,
 // and that polling has what it needs to not run the same ticket forever.

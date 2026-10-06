@@ -57,8 +57,27 @@ type Session interface {
 	// and returns ErrBudget once the task has spent its allowance.
 	Complete(ctx context.Context, req llm.Request) (llm.Response, error)
 
+	// Charge records a model call the agent made on its own, outside
+	// Complete, so the task's cost stays whole. It returns ErrBudget once the
+	// allowance is spent; by then the money has gone, so an agent that can
+	// should pass Budget to whatever it drives and stop before that.
+	Charge(ctx context.Context, call Charge) error
+
+	// Budget is what the task may still spend, in dollars. Zero means there
+	// is no cap.
+	Budget() float64
+
 	// Step records what the agent is doing, for the trace the developer reads.
 	Step(ctx context.Context, text string)
+}
+
+// Charge is one model call made outside Complete: who answered, what it
+// cost, how long it took.
+type Charge struct {
+	Model      string
+	Tokens     protocol.Tokens
+	CostUSD    float64
+	DurationMs int64
 }
 
 // Result is what the agent produced.

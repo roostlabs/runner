@@ -15,6 +15,9 @@ import (
 // fakeSession stands in for the executor: it records what the agent asked for
 // and answers with canned model replies.
 type fakeSession struct {
+	workDir string
+	charges []Charge
+	budget  float64
 	replies []llm.Response
 	// completeErr is returned instead of the reply at that index.
 	completeErr map[int]error
@@ -29,7 +32,12 @@ type fakeSession struct {
 	execFunc func(argv []string) (Exec, error)
 }
 
-func (f *fakeSession) WorkDir() string { return "/work" }
+func (f *fakeSession) WorkDir() string {
+	if f.workDir != "" {
+		return f.workDir
+	}
+	return "/work"
+}
 
 func (f *fakeSession) Exec(_ context.Context, argv []string) (Exec, error) {
 	f.execs = append(f.execs, argv)
@@ -67,6 +75,13 @@ func (f *fakeSession) Complete(_ context.Context, req llm.Request) (llm.Response
 	}
 	return f.replies[n], nil
 }
+
+func (f *fakeSession) Charge(_ context.Context, call Charge) error {
+	f.charges = append(f.charges, call)
+	return nil
+}
+
+func (f *fakeSession) Budget() float64 { return f.budget }
 
 func (f *fakeSession) Step(_ context.Context, text string) {
 	f.steps = append(f.steps, text)
