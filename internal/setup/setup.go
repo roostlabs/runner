@@ -178,7 +178,11 @@ func (w *Wizard) Run(ctx context.Context) error {
 		if did, err := w.Probes.Restart(ctx); err == nil && did != "" {
 			w.say("%s", did)
 		} else {
-			w.say("Start or restart the Runner to pick the config up: systemctl restart %s", ServiceName)
+			if runtime.GOOS == "linux" {
+				w.say("Start or restart the Runner to pick the config up: systemctl restart %s", ServiceName)
+			} else {
+				w.say("Start or restart the Runner to pick the config up.")
+			}
 		}
 	}
 	return nil
