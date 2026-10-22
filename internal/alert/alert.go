@@ -36,6 +36,9 @@ const (
 	// request. It is the alert that exists so the developer does not have to
 	// keep the dashboard open.
 	KindApproval Kind = "awaiting_approval"
+	// KindTest is what setup sends to prove a sink works. It is never
+	// configured as an event and never sent by a task.
+	KindTest Kind = "test"
 )
 
 // Kinds lists every kind, which is also the default set a Notifier sends.
@@ -147,6 +150,8 @@ func Text(ev Event) string {
 		fmt.Fprintf(&b, "Roost: task %s stopped at its budget", ev.TaskID)
 	case KindApproval:
 		fmt.Fprintf(&b, "Roost: task %s is waiting for your approval", ev.TaskID)
+	case KindTest:
+		b.WriteString("Roost: alerts from this server will arrive here")
 	default:
 		fmt.Fprintf(&b, "Roost: task %s: %s", ev.TaskID, ev.Kind)
 	}

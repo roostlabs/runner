@@ -29,6 +29,14 @@ func TestMain(m *testing.M) {
 // ROOST_FAKE_CLAUDE picks the scenario.
 func fakeClaude() int {
 	args := os.Args[1:]
+	if len(args) >= 2 && args[0] == "auth" && args[1] == "status" {
+		if os.Getenv("ROOST_FAKE_CLAUDE") == "auth-ok" {
+			fmt.Println(`{"loggedIn":true,"authMethod":"claude.ai","email":"dev@example.test","subscriptionType":"max"}`)
+		} else {
+			fmt.Println(`{"loggedIn":false}`)
+		}
+		return 0
+	}
 	var cfgPath, budget string
 	for i, a := range args {
 		switch a {
@@ -200,5 +208,18 @@ func TestClaudeCodeNeedsTheCLI(t *testing.T) {
 	_, err := ClaudeCode{Bin: "definitely-not-claude-xyz"}.Run(context.Background(), protocol.TaskRun{}, &fakeSession{})
 	if !errors.Is(err, errNoClaude) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestClaudeStatus(t *testing.T) {
+	exe, _ := os.Executable()
+	t.Setenv("ROOST_FAKE_CLAUDE", "auth-ok")
+	auth, err := ClaudeStatus(context.Background(), exe, nil)
+	if err != nil || !auth.LoggedIn || auth.Email != "dev@example.test" || auth.Subscription != "max" {
+		t.Fatalf("auth = %+v, %v", auth, err)
+	}
+	t.Setenv("ROOST_FAKE_CLAUDE", "auth-no")
+	if auth, err := ClaudeStatus(context.Background(), exe, nil); err != nil || auth.LoggedIn {
+		t.Fatalf("auth = %+v, %v", auth, err)
 	}
 }

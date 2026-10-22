@@ -558,3 +558,27 @@ func priceOf(model string) (Price, bool) {
 	}
 	return prices[best], true
 }
+
+// Verify checks the key against the API without spending anything: it lists
+// models, which is free, and fails the way a rejected key fails.
+func (c *Client) Verify(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/models?limit=1", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("anthropic-version", apiVersion)
+	req.Header.Set("x-api-key", c.key)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("llm: %w", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden:
+		return errors.New("llm: the api rejected the key")
+	case resp.StatusCode >= 300:
+		return fmt.Errorf("llm: GET /v1/models: status %d", resp.StatusCode)
+	}
+	return nil
+}

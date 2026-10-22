@@ -335,3 +335,36 @@ func (t *tail) hint() string {
 	}
 	return "\n" + s
 }
+
+// ClaudeAuth is what the CLI says about its sign-in.
+type ClaudeAuth struct {
+	LoggedIn     bool   `json:"loggedIn"`
+	Method       string `json:"authMethod"`
+	Email        string `json:"email"`
+	Subscription string `json:"subscriptionType"`
+}
+
+// ClaudeStatus asks the CLI whether it is signed in, as the account whose
+// environment env describes. Setup uses it so a Runner is not started on a
+// CLI that would fail its first task with a login prompt nobody sees.
+func ClaudeStatus(ctx context.Context, bin string, env []string) (ClaudeAuth, error) {
+	if bin == "" {
+		bin = "claude"
+	}
+	if _, err := exec.LookPath(bin); err != nil {
+		return ClaudeAuth{}, errNoClaude
+	}
+	cmd := exec.CommandContext(ctx, bin, "auth", "status")
+	if env != nil {
+		cmd.Env = env
+	}
+	out, err := cmd.Output()
+	var auth ClaudeAuth
+	if jsonErr := json.Unmarshal(out, &auth); jsonErr != nil {
+		if err != nil {
+			return ClaudeAuth{}, fmt.Errorf("agent: claude auth status: %w", err)
+		}
+		return ClaudeAuth{}, fmt.Errorf("agent: claude auth status: %w", jsonErr)
+	}
+	return auth, nil
+}

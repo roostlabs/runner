@@ -84,6 +84,36 @@ has nowhere to run.
 macOS and Windows are not supported by the installer, and whether they ever
 should be is still open. Build and run the binary directly there.
 
+### Setting it up
+
+```bash
+roost-runner init                    # ask everything
+roost-runner init -section tracker   # ask one part again
+```
+
+`init` asks what the Runner needs and writes the config file the Runner reads,
+at mode `0600`. It is the same file either way; the wizard is a way of writing
+it, not a second source of truth. Run it after the installer, or on its own on
+a box where you built the binary yourself.
+
+Every credential is tried against its own service before it is written: the
+Cloud token by opening the channel, the Anthropic key by listing models, the
+Claude subscription by asking the CLI whether it is signed in, the git token by
+asking the forge whose it is, the tracker token the same way, and each alert
+sink by sending one test message. A failed check offers a retry, keeping the
+value anyway, or stopping — and nothing is written until the answers make a
+config the Runner would accept, so a run you abandon leaves the old one alone.
+
+What it can read, it offers rather than asks for: the tracker's projects and
+the states of their workflow come from the tracker itself, so the states are
+picked from a list under the names you see in it, and the sandbox image is
+suggested from what the repository is mostly written in. Re-running it shows
+every current value as the default, and Enter keeps it. A credential is never
+printed back, so Enter on a secret keeps the stored one.
+
+When the installer's systemd unit is there and `init` is run as root, it
+restarts the service at the end; otherwise it prints what to run.
+
 ### With Docker Compose
 
 For a box where compose is how services are run, `docker-compose.yml` runs the

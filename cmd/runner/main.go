@@ -60,6 +60,12 @@ func main() {
 }
 
 func run() error {
+	// `init` is a subcommand rather than a flag: it does not start a Runner,
+	// it writes the file one needs.
+	if len(os.Args) > 1 && os.Args[1] == "init" {
+		return initConfig(os.Args[2:])
+	}
+
 	configPath := flag.String("config", config.DefaultPath(), "path to the runner config file")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn or error")
 	showVersion := flag.Bool("version", false, "print the version and exit")

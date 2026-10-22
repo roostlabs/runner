@@ -269,3 +269,23 @@ func TestNewRequiresAKey(t *testing.T) {
 		t.Error("New accepted an empty api key")
 	}
 }
+
+func TestVerify(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" || r.Header.Get("x-api-key") != "good" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer srv.Close()
+
+	good, _ := New(Options{APIKey: "good", BaseURL: srv.URL})
+	if err := good.Verify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	bad, _ := New(Options{APIKey: "bad", BaseURL: srv.URL})
+	if err := bad.Verify(context.Background()); err == nil {
+		t.Fatal("a rejected key verified")
+	}
+}
